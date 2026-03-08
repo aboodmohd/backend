@@ -204,6 +204,11 @@ def probe_stream_candidate(url, headers):
         return False
 
     provider = detect_provider(url)
+    lowered_url = url.lower()
+
+    if any(token in lowered_url for token in ['storm.vodvidl.site/proxy/file2%2f', '/proxy/file2%2f', '%2ffile2%2f']):
+        log_provider(provider, f"probe accepted heuristic url={short_url(url)}")
+        return True
 
     probe_headers = {
         'User-Agent': headers.get('User-Agent') or headers.get('user-agent') or 'Mozilla/5.0',
@@ -802,6 +807,13 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         result = max(valid_streams, key=lambda stream: stream_priority(stream['url']))
                         print(f"✅ Success: Captured Valid Stream ({result['url'][:40]}...)")
                         result["headers"]["Cookie"] = cookie_str
+
+                if not result and local_winner.get("url"):
+                    result = {
+                        "url": local_winner["url"],
+                        "headers": {**local_winner.get("headers", {}), "Cookie": cookie_str},
+                    }
+                    print(f"✅ Success: Falling Back To Winner ({result['url'][:40]}...)")
 
                 if result:
                     log_provider(provider, f"returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
