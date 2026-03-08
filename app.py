@@ -91,6 +91,8 @@ def stream_priority(candidate_url):
         score += 120
     if '/file2/' in lowered or '/proxy/file2/' in lowered:
         score += 95
+    if '%2ffile2%2f' in lowered or '%2fproxy%2ffile2%2f' in lowered:
+        score += 95
     if 'workers.dev/' in lowered:
         score += 45
     if 'master' in lowered:
@@ -111,7 +113,9 @@ def looks_like_stream_url(url):
     if not url:
         return False
     lowered = url.lower()
-    return any(token in lowered for token in STRICT_MEDIA_PATTERNS)
+    return any(token in lowered for token in STRICT_MEDIA_PATTERNS) or any(
+        token in lowered for token in ['%2ffile2%2f', '%2fproxy%2ffile2%2f', '%2fplaylist%2f', 'proxy/file2%2f']
+    )
 
 
 def is_playlist_response(url, content_type='', body=''):
@@ -574,7 +578,12 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
             current_winner_score = stream_priority(local_winner.get('url'))
             candidate_score = stream_priority(candidate_url)
-            should_promote = force_winner or (preferred_quality != 'Auto' and preferred_quality.replace('p', '') in candidate_url)
+            should_promote = (
+                force_winner
+                or not local_winner.get('url')
+                or candidate_score > current_winner_score
+                or (preferred_quality != 'Auto' and preferred_quality.replace('p', '') in candidate_url)
+            )
 
             if should_promote and candidate_score >= current_winner_score:
                 local_winner.update(candidate)
