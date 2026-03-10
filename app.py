@@ -33,6 +33,7 @@ STRICT_MEDIA_PATTERNS = [
     'master.json', 'cf-master', '/stream2/', '/vod/', '/file2/', '/proxy/file2/',
     'workers.dev/', 'videostr.net', 'vhls', '/v4/tab/', 'index.m3u8'
 ]
+PROVIDER_ORDER = ['vidlink', 'vidfast', '111movies', 'vidnest']
 
 
 def short_url(url, limit=90):
@@ -43,10 +44,71 @@ def short_url(url, limit=90):
 
 def detect_provider(url):
     lowered = (url or '').lower()
-    for provider in ['vidfast', 'vidrock', '111movies', 'vidnest']:
+    for provider in ['vidlink', 'vidfast', 'vidrock', '111movies', 'vidnest']:
         if provider in lowered:
             return provider
     return 'generic'
+
+
+def parse_media_target(url):
+    movie_match = re.search(r'/movie/(\d+)', url or '', re.IGNORECASE)
+    if movie_match:
+        return {'type': 'movie', 'tmdb_id': movie_match.group(1)}
+
+    tv_match = re.search(r'/tv/(\d+)/(\d+)/(\d+)', url or '', re.IGNORECASE)
+    if tv_match:
+        return {
+            'type': 'tv',
+            'tmdb_id': tv_match.group(1),
+            'season': tv_match.group(2),
+            'episode': tv_match.group(3),
+        }
+
+    return None
+
+
+def build_provider_url(provider, target):
+    if not target:
+        return None
+
+    if target['type'] == 'movie':
+        if provider == 'vidlink':
+            return f"https://vidlink.pro/movie/{target['tmdb_id']}"
+        if provider == 'vidfast':
+            return f"https://vidfast.pro/movie/{target['tmdb_id']}?autoPlay=true"
+        if provider == '111movies':
+            return f"https://111movies.net/movie/{target['tmdb_id']}"
+        if provider == 'vidnest':
+            return f"https://vidnest.fun/movie/{target['tmdb_id']}"
+
+    if target['type'] == 'tv':
+        if provider == 'vidlink':
+            return f"https://vidlink.pro/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
+        if provider == 'vidfast':
+            return f"https://vidfast.pro/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}?autoPlay=true"
+        if provider == '111movies':
+            return f"https://111movies.net/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
+        if provider == 'vidnest':
+            return f"https://vidnest.fun/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
+
+    return None
+
+
+def expand_provider_urls(url):
+    target = parse_media_target(url)
+    requested_provider = detect_provider(url)
+    ordered_providers = [requested_provider] + [provider for provider in PROVIDER_ORDER if provider != requested_provider]
+
+    candidates = []
+    seen = set()
+
+    for candidate_url in [url] + [build_provider_url(provider, target) for provider in ordered_providers]:
+        if not candidate_url or candidate_url in seen:
+            continue
+        seen.add(candidate_url)
+        candidates.append(candidate_url)
+
+    return candidates
 
 
 def log_provider(provider, message):
@@ -523,7 +585,6 @@ def fetch_subtitles_from_subdl(tmdb_id, media_type, season=None, episode=None, l
     return results
 
 def extract_stream_with_playwright(url, preferred_quality='Auto'):
-    print(f"📡 Omni-Extraction Mode: {url} (Quality: {preferred_quality})")
     provider = detect_provider(url)
     log_provider(provider, f"starting extraction quality={preferred_quality}")
     
@@ -961,6 +1022,38 @@ def proxy(_name=None):
         log_provider(provider, f"proxy failure error={e} url={short_url(url)}")
         return str(e), 500
 
+
+def resolve_provider_candidate(candidate_url, preferred_quality):
+    provider = detect_provider(candidate_url)
+    log_provider(provider, f"attempting candidate quality={preferred_quality} url={short_url(candidate_url)}")
+
+    extracted = extract_stream_with_playwright(candidate_url, preferred_quality)
+    curr_url = extracted.get('url')
+    curr_headers = extracted.get('headers', {})
+
+    if not probe_stream_candidate(curr_url, curr_headers):
+        log_provider(provider, f"validation failed extracted={short_url(curr_url)}")
+        return None
+
+    prov_keywords = ['workers.dev', 'vidrock', 'vidfast', 'vidnest', 'vhls', 'm3u8-proxy', '111movies']
+    should_proxy = any(kw in (curr_url or '').lower() for kw in prov_keywords) or any(kw in candidate_url.lower() for kw in prov_keywords)
+    referer = curr_headers.get('referer', '') or curr_headers.get('Referer', '') or candidate_url
+    cookie = curr_headers.get('Cookie', '') or curr_headers.get('cookie', '')
+
+    response_payload = {
+        "success": True,
+        "url": build_proxy_url(request.host, curr_url, referer, cookie) if should_proxy else curr_url,
+        "headers": curr_headers,
+        "subtitles": extracted.get('subtitles', []),
+        "provider": provider,
+        "sourceUrl": candidate_url,
+    }
+
+    if should_proxy:
+        log_provider(provider, f"proxying extracted={short_url(curr_url)}")
+
+    return response_payload
+
 @app.route('/resolve', methods=['POST', 'GET'])
 def resolve():
     try:
@@ -976,50 +1069,24 @@ def resolve():
         if not url:
             return jsonify({"success": False, "error": "No url provided"}), 400
 
-        provider = detect_provider(url)
-        log_provider(provider, f"resolve request quality={preferred_quality} url={short_url(url)}")
+        requested_provider = detect_provider(url)
+        log_provider(requested_provider, f"resolve request quality={preferred_quality} url={short_url(url)}")
 
-        print(f"Resolving with Playwright (Quality: {preferred_quality}): {url}")
-        extracted = extract_stream_with_playwright(url, preferred_quality)
-        
-        curr_url = extracted.get('url')
-        curr_headers = extracted.get('headers', {})
-        
-        # STRICT VALIDATION: Ensure we actually found a video file, not an HTML page
-        is_valid_video = probe_stream_candidate(curr_url, curr_headers)
-        if not is_valid_video:
-            print(f"⚠️ Validation Failed: Extracted URL is not a direct video stream.")
-            log_provider(provider, f"validation failed extracted={short_url(curr_url)}")
-            return jsonify({
-                "success": False, 
-                "error": "Failed to extract raw video. Bot protection detected."
-            }), 400
+        attempted_urls = []
+        for candidate_url in expand_provider_urls(url):
+            attempted_urls.append(candidate_url)
+            resolved_payload = resolve_provider_candidate(candidate_url, preferred_quality)
+            if resolved_payload:
+                if len(attempted_urls) > 1:
+                    log_provider(detect_provider(candidate_url), f"fallback success attempts={len(attempted_urls)}")
+                return jsonify(resolved_payload)
 
-        # APPLY PROXY TO BYPASS 403s
-        prov_keywords = ['workers.dev', 'vidrock', 'vidfast', 'vidnest', 'vhls', 'm3u8-proxy', '111movies']
-        should_proxy = any(kw in (curr_url or '').lower() for kw in prov_keywords) or any(kw in url.lower() for kw in prov_keywords)
-
-        if should_proxy:
-            print(f"🛠️ Wrapping '{url[:20]}...' in Backend Proxy...")
-            referer = curr_headers.get('referer', '') or curr_headers.get('Referer', '') or url
-            cookie = curr_headers.get('Cookie', '') or curr_headers.get('cookie', '')
-            
-            proxy_url = build_proxy_url(request.host, curr_url, referer, cookie)
-            log_provider(provider, f"proxying extracted={short_url(curr_url)} proxy={short_url(proxy_url)}")
-
-            return jsonify({
-                "success": True,
-                "url": proxy_url,
-                "headers": curr_headers,
-                "subtitles": extracted.get('subtitles', [])
-            })
-
+        log_provider(requested_provider, f"all provider attempts failed count={len(attempted_urls)}")
         return jsonify({
-            "success": True,
-            "url": curr_url,
-            "headers": curr_headers,
-            "subtitles": extracted.get('subtitles', [])
-        })
+            "success": False,
+            "error": "Failed to extract raw video. Bot protection detected.",
+            "attemptedProviders": [detect_provider(item) for item in attempted_urls],
+        }), 400
     except Exception as e:
         print(f"🔥 Critical Resolve Error: {e}")
         log_provider(detect_provider(request.args.get('url') or ''), f"resolve exception error={e}")
