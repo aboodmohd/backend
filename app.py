@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, Response
 import requests
 import re
+import os
+import time
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 import requests.packages.urllib3
@@ -22,6 +24,11 @@ def home():
 SUBDL_API_KEY = "EuWRVpLf2Iyd-52MZ3n9Iyi_TX4yxL4-"
 SUBSOURCE_API_KEY = "sk_2da97448424b9e7c94fbc9756291c5eac67711df44b978f43fc7ba541163a77a"
 SUBTITLE_CACHE = {}
+STREAM_CACHE = {}
+STREAM_CACHE_TTL_SECONDS = int(os.getenv('STREAM_CACHE_TTL_SECONDS', '5400'))
+PLAYWRIGHT_PROXY_SERVER = os.getenv('PLAYWRIGHT_PROXY_SERVER', '').strip()
+PLAYWRIGHT_PROXY_USERNAME = os.getenv('PLAYWRIGHT_PROXY_USERNAME', '').strip()
+PLAYWRIGHT_PROXY_PASSWORD = os.getenv('PLAYWRIGHT_PROXY_PASSWORD', '').strip()
 STREAM_HINT_KEYWORDS = [
     '.m3u8', '.mp4', '.m4v', '.ts', 'playlist', 'master', 'manifest',
     'worker', 'skylark', 'storm', 'vhls', 'vidfast', 'vidrock',
@@ -94,10 +101,16 @@ def build_provider_url(provider, target):
     return None
 
 
-def expand_provider_urls(url):
+def expand_provider_urls(url, providers=None):
     target = parse_media_target(url)
     requested_provider = detect_provider(url)
-    ordered_providers = [requested_provider] + [provider for provider in PROVIDER_ORDER if provider != requested_provider]
+    normalized_providers = []
+    for provider in providers or []:
+        lowered = (provider or '').strip().lower()
+        if lowered and lowered not in normalized_providers:
+            normalized_providers.append(lowered)
+
+    ordered_providers = normalized_providers or [requested_provider] + [provider for provider in PROVIDER_ORDER if provider != requested_provider]
 
     candidates = []
     seen = set()
@@ -109,6 +122,42 @@ def expand_provider_urls(url):
         candidates.append(candidate_url)
 
     return candidates
+
+
+def build_stream_cache_key(url, preferred_quality, providers=None):
+    normalized_providers = ','.join((provider or '').strip().lower() for provider in (providers or []) if provider)
+    return f"{url}|{preferred_quality}|{normalized_providers or 'default'}"
+
+
+def get_cached_stream_result(cache_key):
+    cached_entry = STREAM_CACHE.get(cache_key)
+    if not cached_entry:
+        return None
+
+    if cached_entry['expires_at'] <= time.time():
+        STREAM_CACHE.pop(cache_key, None)
+        return None
+
+    return cached_entry['payload']
+
+
+def set_cached_stream_result(cache_key, payload):
+    STREAM_CACHE[cache_key] = {
+        'payload': payload,
+        'expires_at': time.time() + STREAM_CACHE_TTL_SECONDS,
+    }
+
+
+def build_playwright_proxy_settings():
+    if not PLAYWRIGHT_PROXY_SERVER:
+        return None
+
+    proxy_config = {'server': PLAYWRIGHT_PROXY_SERVER}
+    if PLAYWRIGHT_PROXY_USERNAME:
+        proxy_config['username'] = PLAYWRIGHT_PROXY_USERNAME
+    if PLAYWRIGHT_PROXY_PASSWORD:
+        proxy_config['password'] = PLAYWRIGHT_PROXY_PASSWORD
+    return proxy_config
 
 
 def log_provider(provider, message):
@@ -684,18 +733,26 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
                 log_provider(provider, f"[{mode_label}] launching chromium")
-                browser = p.chromium.launch(
-                    headless=True,
-                    chromium_sandbox=False,
-                    timeout=45000,
-                    args=[
+                launch_options = {
+                    'headless': True,
+                    'chromium_sandbox': False,
+                    'timeout': 45000,
+                    'args': [
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-dev-shm-usage',
                         '--disable-gpu',
                         '--disable-software-rasterizer',
-                    ]
+                    ],
+                }
+                proxy_settings = build_playwright_proxy_settings()
+                if proxy_settings:
+                    launch_options['proxy'] = proxy_settings
+                    log_provider(provider, f"[{mode_label}] using upstream proxy={short_url(proxy_settings['server'], 40)}")
+
+                browser = p.chromium.launch(
+                    **launch_options
                 )
                 log_provider(provider, f"[{mode_label}] chromium launched")
                 
@@ -1054,9 +1111,32 @@ def resolve_provider_candidate(candidate_url, preferred_quality):
 
     return response_payload
 
+
+def parse_requested_providers(payload, query_args):
+    providers = []
+
+    if isinstance(payload, dict):
+        requested = payload.get('providers')
+        if isinstance(requested, list):
+            providers.extend(requested)
+        elif isinstance(requested, str):
+            providers.extend(requested.split(','))
+
+    query_value = query_args.get('providers', '')
+    if query_value:
+        providers.extend(query_value.split(','))
+
+    normalized = []
+    for provider in providers:
+        lowered = (provider or '').strip().lower()
+        if lowered in PROVIDER_ORDER and lowered not in normalized:
+            normalized.append(lowered)
+    return normalized
+
 @app.route('/resolve', methods=['POST', 'GET'])
 def resolve():
     try:
+        data = {}
         preferred_quality = 'Auto'
         if request.method == 'POST':
             data = request.json or {}
@@ -1070,13 +1150,21 @@ def resolve():
             return jsonify({"success": False, "error": "No url provided"}), 400
 
         requested_provider = detect_provider(url)
+        requested_providers = parse_requested_providers(data, request.args)
         log_provider(requested_provider, f"resolve request quality={preferred_quality} url={short_url(url)}")
 
+        cache_key = build_stream_cache_key(url, preferred_quality, requested_providers)
+        cached_payload = get_cached_stream_result(cache_key)
+        if cached_payload:
+            log_provider(requested_provider, f"cache hit quality={preferred_quality} url={short_url(url)}")
+            return jsonify(cached_payload)
+
         attempted_urls = []
-        for candidate_url in expand_provider_urls(url):
+        for candidate_url in expand_provider_urls(url, requested_providers):
             attempted_urls.append(candidate_url)
             resolved_payload = resolve_provider_candidate(candidate_url, preferred_quality)
             if resolved_payload:
+                set_cached_stream_result(cache_key, resolved_payload)
                 if len(attempted_urls) > 1:
                     log_provider(detect_provider(candidate_url), f"fallback success attempts={len(attempted_urls)}")
                 return jsonify(resolved_payload)
