@@ -723,7 +723,11 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
                 def wait_for_challenge_clear(label):
                     try:
-                        for attempt in range(1, 13):
+                        for attempt in range(1, 9):
+                            if is_url_video(local_winner.get("url")) or any(is_url_video(item.get('url')) for item in local_streams):
+                                log_provider(provider, f"challenge short-circuited mode={label} attempt={attempt} winner={short_url(local_winner.get('url'))}")
+                                return
+
                             html = page.content()
                             current_page_url = page.url
                             if not is_challenge_page(html, current_page_url):
@@ -741,7 +745,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                                 page.mouse.wheel(0, 400)
                             except Exception:
                                 pass
-                            page.wait_for_timeout(500)
+                            page.wait_for_timeout(250)
 
                         log_provider(provider, f"challenge persisted mode={label} final_url={short_url(page.url)}")
                     except Exception as exc:
@@ -754,8 +758,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         wait_for_challenge_clear('warmup')
                     
                     # 15s Timeout as per Ultimate Fix Blueprint
-                    page.goto(url, wait_until='domcontentloaded', timeout=12000)
-                    page.wait_for_timeout(500)
+                    page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                    page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
                 except: pass
 
@@ -806,7 +810,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     except Exception:
                         pass
 
-                interact(); page.wait_for_timeout(500)
+                interact(); page.wait_for_timeout(250)
                 scan_dom_for_sources()
 
                 if is_url_video(local_winner["url"]):
@@ -814,9 +818,11 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     return finalize_result(context, browser, local_winner, "Success: Captured Quality")
                 
                 # Check discovery loop
-                for _ in range(6):
+                for _ in range(2):
                     if is_url_video(local_winner["url"]): break
-                    page.wait_for_timeout(500)
+                    if any(is_url_video(item.get('url')) for item in local_streams):
+                        break
+                    page.wait_for_timeout(250)
                     if not local_streams:
                         interact()
                     scan_dom_for_sources()
