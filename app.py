@@ -539,6 +539,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         return any(token in lowered for token in ['.m3u8', 'playlist', 'master', 'manifest', '/file2/', '/stream2/'])
 
     def try_extraction(is_mobile=False):
+        mode_label = 'Mobile' if is_mobile else 'Desktop'
         local_streams = []
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
@@ -621,18 +622,21 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 if is_mobile: 
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
-                # Performance Tip: minimal browser setup for 2017 MacBook
+                log_provider(provider, f"[{mode_label}] launching chromium")
                 browser = p.chromium.launch(
                     headless=True,
+                    chromium_sandbox=False,
+                    timeout=45000,
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-dev-shm-usage',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                        '--disable-web-security',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
                     ]
                 )
+                log_provider(provider, f"[{mode_label}] chromium launched")
                 
                 context_args = {
                     "user_agent": ua,
