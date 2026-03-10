@@ -543,6 +543,39 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
 
+        def build_cookie_header(context):
+            try:
+                cookies = context.cookies()
+                cookie_pairs = []
+                for cookie_item in cookies:
+                    name = cookie_item.get('name')
+                    value = cookie_item.get('value')
+                    if name and value is not None:
+                        cookie_pairs.append(f"{name}={value}")
+                cookie_str = "; ".join(cookie_pairs)
+                log_provider(provider, f"[{mode_label}] cookie snapshot count={len(cookie_pairs)}")
+                return cookie_str
+            except Exception as exc:
+                log_provider(provider, f"[{mode_label}] cookie snapshot failed error={exc}")
+                return ''
+
+        def finalize_result(context, browser, result, success_label):
+            cookie_str = build_cookie_header(context)
+            if result is not None:
+                result.setdefault("headers", {})["Cookie"] = cookie_str
+                result["subtitles"] = local_subtitles
+                result["mode"] = mode_label.lower()
+                print(f"✅ [{mode_label}] {success_label} ({result['url'][:40]}...)")
+                log_provider(provider, f"[{mode_label}] returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
+
+            try:
+                browser.close()
+                log_provider(provider, f"[{mode_label}] browser closed")
+            except Exception as exc:
+                log_provider(provider, f"[{mode_label}] browser close failed error={exc}")
+
+            return result
+
         def remember_subtitle(candidate_url, label=''):
             if not candidate_url or not looks_like_subtitle_url(candidate_url):
                 return
@@ -722,6 +755,10 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     wait_for_challenge_clear('target')
                 except: pass
 
+                if is_url_video(local_winner["url"]):
+                    log_provider(provider, f"[{mode_label}] early winner after navigation")
+                    return finalize_result(context, browser, local_winner, "Success: Early Winner")
+
                 def scan_dom_for_sources():
                     try:
                         discovered = page.evaluate("""
@@ -769,12 +806,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 scan_dom_for_sources()
 
                 if is_url_video(local_winner["url"]):
-                    cookies = context.cookies()
-                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-                    browser.close()
-                    local_winner["headers"]["Cookie"] = cookie_str
-                    local_winner["subtitles"] = local_subtitles
-                    return local_winner
+                    log_provider(provider, f"[{mode_label}] winner confirmed after DOM scan")
+                    return finalize_result(context, browser, local_winner, "Success: Captured Quality")
                 
                 # Check discovery loop
                 for _ in range(6):
@@ -785,31 +818,35 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     scan_dom_for_sources()
 
                 if not local_streams:
+                    log_provider(provider, f"[{mode_label}] no streams after loop, scanning page HTML fallback")
                     m3u8_match = re.search(r'(https?://[^"\']+(?:m3u8|mp4|json|txt|playlist|master|manifest)[^"\']*)', page.content())
                     if m3u8_match and is_url_video(m3u8_match.group(1)):
                         remember_stream(m3u8_match.group(1), {"Referer": url}, force_winner=True)
 
-                cookies = context.cookies()
-                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-                browser.close()
-
                 result = None
                 if is_url_video(local_winner["url"]):
-                    print(f"✅ Success: Captured Quality ({local_winner['url'][:40]}...)")
-                    local_winner["headers"]["Cookie"] = cookie_str
                     result = local_winner
                 else:
                     valid_streams = [s for s in local_streams if is_url_video(s['url'])]
                     if valid_streams:
                         result = max(valid_streams, key=lambda stream: stream_priority(stream['url']))
-                        print(f"✅ Success: Captured Valid Stream ({result['url'][:40]}...)")
-                        result["headers"]["Cookie"] = cookie_str
+
+                if not result and local_winner.get("url"):
+                    result = {
+                        "url": local_winner["url"],
+                        "headers": {**local_winner.get("headers", {})},
+                    }
 
                 if result:
-                    log_provider(provider, f"returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
-                    result["subtitles"] = local_subtitles
-                    return result
-                log_provider(provider, f"no playable stream found subtitles={len(local_subtitles)} candidates={len(local_streams)}")
+                    label = "Success: Captured Quality" if result is local_winner else "Success: Captured Valid Stream"
+                    return finalize_result(context, browser, result, label)
+
+                try:
+                    browser.close()
+                    log_provider(provider, f"[{mode_label}] browser closed without result")
+                except Exception as exc:
+                    log_provider(provider, f"[{mode_label}] browser close failed without result error={exc}")
+                log_provider(provider, f"[{mode_label}] no playable stream found subtitles={len(local_subtitles)} candidates={len(local_streams)}")
                     
         except Exception as e:
             print(f"❌ Playwright Error ({'Mobile' if is_mobile else 'Desktop'}): {e}")
