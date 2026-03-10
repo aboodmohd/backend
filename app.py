@@ -426,18 +426,71 @@ def infer_subtitle_language_from_url(url):
     return 'Default', 'UN'
 
 
+def infer_subtitle_language_from_code(code):
+    normalized = (code or '').strip().lower().replace('_', '-').split('-')[0]
+    mapping = {
+        'en': ('English', 'EN'),
+        'ar': ('Arabic', 'AR'),
+        'es': ('Spanish', 'ES'),
+        'fr': ('French', 'FR'),
+        'de': ('German', 'DE'),
+        'it': ('Italian', 'IT'),
+        'pt': ('Portuguese', 'PT'),
+        'tr': ('Turkish', 'TR'),
+        'ru': ('Russian', 'RU'),
+        'hi': ('Hindi', 'HI'),
+        'id': ('Indonesian', 'ID'),
+        'ms': ('Malay', 'MS'),
+        'th': ('Thai', 'TH'),
+        'vi': ('Vietnamese', 'VI'),
+        'ko': ('Korean', 'KO'),
+        'ja': ('Japanese', 'JA'),
+        'zh': ('Chinese', 'ZH'),
+        'pl': ('Polish', 'PL'),
+        'nl': ('Dutch', 'NL'),
+        'sv': ('Swedish', 'SV'),
+        'no': ('Norwegian', 'NO'),
+        'da': ('Danish', 'DA'),
+        'fi': ('Finnish', 'FI'),
+        'uk': ('Ukrainian', 'UK'),
+        'fa': ('Persian', 'FA'),
+        'he': ('Hebrew', 'HE'),
+    }
+    return mapping.get(normalized)
+
+
 def infer_subtitle_language_from_label(label, fallback_url=''):
     lowered = (label or '').strip().lower()
+    code_guess = infer_subtitle_language_from_code(lowered)
+    if code_guess:
+        return code_guess
     if any(token in lowered for token in ['arabic', ' arabic', ' ar', '[ar]', '(ar)', 'ara']):
         return 'Arabic', 'AR'
     if any(token in lowered for token in ['english', ' eng', ' en', '[en]', '(en)']):
         return 'English', 'EN'
+    if any(token in lowered for token in ['spanish', ' esp', ' es', '[es]', '(es)', 'spa']):
+        return 'Spanish', 'ES'
+    if any(token in lowered for token in ['french', ' fr', '[fr]', '(fr)', 'fre', 'fra']):
+        return 'French', 'FR'
+    if any(token in lowered for token in ['german', ' de', '[de]', '(de)', 'ger', 'deu']):
+        return 'German', 'DE'
     return infer_subtitle_language_from_url(fallback_url)
 
 
 def looks_like_subtitle_url(url):
     lowered = (url or '').lower()
     return any(token in lowered for token in ['.vtt', '.srt', '.ass', '.ssa', 'subtitle', '/sub/', 'captions', 'texttrack'])
+
+
+def resolve_candidate_url(candidate_url, base_url):
+    if not candidate_url:
+        return None
+    if isinstance(candidate_url, str) and candidate_url.startswith(('http://', 'https://')):
+        return candidate_url
+    try:
+        return urljoin(base_url, candidate_url)
+    except Exception:
+        return candidate_url
 
 
 def extract_subtitle_candidates_from_json_payload(payload):
@@ -448,7 +501,7 @@ def extract_subtitle_candidates_from_json_payload(payload):
             url_value = None
             for key in ['file', 'src', 'url', 'track', 'subtitle', 'subtitleUrl']:
                 candidate = value.get(key)
-                if isinstance(candidate, str) and candidate.startswith(('http://', 'https://')) and looks_like_subtitle_url(candidate):
+                if isinstance(candidate, str) and looks_like_subtitle_url(candidate):
                     url_value = candidate
                     break
 
@@ -688,15 +741,16 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             return result
 
         def remember_subtitle(candidate_url, label=''):
-            if not candidate_url or not looks_like_subtitle_url(candidate_url):
+            resolved_url = resolve_candidate_url(candidate_url, page.url if 'page' in locals() else url)
+            if not resolved_url or not looks_like_subtitle_url(resolved_url):
                 return
-            if any(s['url'] == candidate_url for s in local_subtitles):
+            if any(s['url'] == resolved_url for s in local_subtitles):
                 return
 
-            language_name, language_code = infer_subtitle_language_from_label(label, candidate_url)
-            print(f"🗨️ Captured Subtitle: {candidate_url[:40]}...")
+            language_name, language_code = infer_subtitle_language_from_label(label, resolved_url)
+            print(f"🗨️ Captured Subtitle: {resolved_url[:40]}...")
             local_subtitles.append({
-                "url": candidate_url,
+                "url": resolved_url,
                 "language": language_name,
                 "languageCode": language_code,
                 "provider": "embed",
@@ -891,18 +945,25 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                             () => {
                                 const found = [];
                                 const attrs = ['src', 'href', 'data-src', 'data-url'];
+                                const absolutize = (value) => {
+                                    try {
+                                        return new URL(value, window.location.href).toString();
+                                    } catch (e) {
+                                        return value;
+                                    }
+                                };
                                 for (const el of document.querySelectorAll('video, source, iframe, a, [src], [href], [data-src], [data-url]')) {
                                     for (const attr of attrs) {
                                         const value = el.getAttribute(attr);
-                                        if (value && /^https?:/i.test(value)) {
-                                            found.push({ url: value, label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
+                                        if (value && !/^javascript:/i.test(value) && !/^data:/i.test(value)) {
+                                            found.push({ url: absolutize(value), label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
                                         }
                                     }
                                 }
                                 for (const el of document.querySelectorAll('track[kind="subtitles"], track[kind="captions"], [data-subtitle], [data-track]')) {
                                     const value = el.getAttribute('src') || el.getAttribute('data-subtitle') || el.getAttribute('data-track') || el.getAttribute('data-src');
-                                    if (value && /^https?:/i.test(value)) {
-                                        found.push({ url: value, label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
+                                    if (value && !/^javascript:/i.test(value) && !/^data:/i.test(value)) {
+                                        found.push({ url: absolutize(value), label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
                                     }
                                 }
                                 const configs = [];
