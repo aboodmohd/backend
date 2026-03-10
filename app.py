@@ -3,7 +3,6 @@ import requests
 import re
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
-import threading
 import requests.packages.urllib3
 import io
 import json
@@ -144,7 +143,8 @@ def build_proxy_url(host, target_url, referer='', cookie=''):
     elif '.ts' in lowered:
         proxy_name = 'segment.ts'
 
-    proxy_url = f"http://{host}/proxy/{proxy_name}?url={quote(target_url, safe='')}"
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', request.scheme or 'http')
+    proxy_url = f"{forwarded_proto}://{host}/proxy/{proxy_name}?url={quote(target_url, safe='')}"
     if referer:
         proxy_url += f"&referer={quote(referer, safe='')}"
     if cookie:
@@ -604,13 +604,24 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
                 # Performance Tip: minimal browser setup for 2017 MacBook
-                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'])
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--disable-web-security',
+                    ]
+                )
                 
                 context_args = {
                     "user_agent": ua,
                     "viewport": {'width': 390, 'height': 844} if is_mobile else {'width': 1280, 'height': 720},
                     "has_touch": is_mobile,
                     "is_mobile": is_mobile,
+                    "ignore_https_errors": True,
                     "locale": "en-US",
                     "timezone_id": "America/New_York",
                     "extra_http_headers": {
@@ -634,7 +645,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 context.route(
                     "**/*",
                     lambda route: route.abort()
-                    if route.request.resource_type in ["image", "font", "stylesheet", "media"]
+                    if route.request.resource_type in ["media"]
                     or any(domain in route.request.url.lower() for domain in BLOCK_DOMAINS)
                     else route.continue_()
                 )
@@ -828,40 +839,21 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             log_provider(provider, f"[{mode_label}] playwright exception error={e}")
         return None
 
-    result_holder = []
-    worker_results = []
-    completion = {"count": 0}
-    result_lock = threading.Lock()
-    done_event = threading.Event()
+    log_provider(provider, "launching desktop worker")
+    desktop_result = try_extraction(is_mobile=False)
+    if desktop_result and desktop_result.get('url'):
+        desktop_result["success"] = True
+        log_provider(provider, f"worker Desktop WON with url={short_url(desktop_result['url'])}")
+        return desktop_result
 
-    def run_worker(is_mobile):
-        mode_label = 'mobile' if is_mobile else 'desktop'
-        worker_result = try_extraction(is_mobile=is_mobile)
-        with result_lock:
-            worker_results.append({"mode": mode_label, "result": worker_result})
-            if worker_result and worker_result.get('url') and not result_holder:
-                result_holder.append(worker_result)
-                done_event.set()
-            completion["count"] += 1
-            if completion["count"] >= 2:
-                done_event.set()
+    log_provider(provider, "desktop worker failed, launching mobile worker")
+    mobile_result = try_extraction(is_mobile=True)
+    if mobile_result and mobile_result.get('url'):
+        mobile_result["success"] = True
+        log_provider(provider, f"worker Mobile WON with url={short_url(mobile_result['url'])}")
+        return mobile_result
 
-    desktop_thread = threading.Thread(target=run_worker, args=(False,), daemon=True)
-    mobile_thread = threading.Thread(target=run_worker, args=(True,), daemon=True)
-    desktop_thread.start()
-    mobile_thread.start()
-    done_event.wait(45)
-
-    if result_holder:
-        result_holder[0]["success"] = True
-        return result_holder[0]
-
-    valid_results = [item["result"] for item in worker_results if item.get("result") and item["result"].get("url")]
-    if valid_results:
-        best_result = max(valid_results, key=lambda item: stream_priority(item.get('url')))
-        best_result["success"] = True
-        return best_result
-          
+    log_provider(provider, "both workers finished without a direct stream")
     return {"url": None, "headers": {}, "success": False, "subtitles": []}
 
 @app.route('/proxy')
