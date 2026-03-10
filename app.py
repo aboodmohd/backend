@@ -1131,7 +1131,41 @@ def parse_requested_providers(payload, query_args):
         lowered = (provider or '').strip().lower()
         if lowered in PROVIDER_ORDER and lowered not in normalized:
             normalized.append(lowered)
-    return normalized
+    return normalized[:5]
+
+
+def run_provider_race(url, preferred_quality, requested_providers):
+    candidate_urls = expand_provider_urls(url, requested_providers)
+    attempt_details = []
+
+    log_provider(detect_provider(url), f"race-to-stream start candidates={len(candidate_urls)} quality={preferred_quality}")
+
+    for index, candidate_url in enumerate(candidate_urls, start=1):
+        provider = detect_provider(candidate_url)
+        started_at = time.time()
+        log_provider(provider, f"race attempt={index}/{len(candidate_urls)} url={short_url(candidate_url)}")
+
+        resolved_payload = resolve_provider_candidate(candidate_url, preferred_quality)
+        elapsed_ms = int((time.time() - started_at) * 1000)
+
+        attempt_record = {
+            "provider": provider,
+            "sourceUrl": candidate_url,
+            "elapsedMs": elapsed_ms,
+            "success": bool(resolved_payload),
+        }
+        attempt_details.append(attempt_record)
+
+        if resolved_payload:
+            resolved_payload["attempts"] = attempt_details
+            resolved_payload["raceMode"] = "sequential-first-success"
+            resolved_payload["requestedProviders"] = requested_providers or [item["provider"] for item in attempt_details]
+            log_provider(provider, f"race winner attempt={index} elapsedMs={elapsed_ms}")
+            return resolved_payload, attempt_details
+
+        log_provider(provider, f"race miss attempt={index} elapsedMs={elapsed_ms}")
+
+    return None, attempt_details
 
 @app.route('/resolve', methods=['POST', 'GET'])
 def resolve():
@@ -1159,21 +1193,20 @@ def resolve():
             log_provider(requested_provider, f"cache hit quality={preferred_quality} url={short_url(url)}")
             return jsonify(cached_payload)
 
-        attempted_urls = []
-        for candidate_url in expand_provider_urls(url, requested_providers):
-            attempted_urls.append(candidate_url)
-            resolved_payload = resolve_provider_candidate(candidate_url, preferred_quality)
-            if resolved_payload:
-                set_cached_stream_result(cache_key, resolved_payload)
-                if len(attempted_urls) > 1:
-                    log_provider(detect_provider(candidate_url), f"fallback success attempts={len(attempted_urls)}")
-                return jsonify(resolved_payload)
+        resolved_payload, attempt_details = run_provider_race(url, preferred_quality, requested_providers)
+        if resolved_payload:
+            set_cached_stream_result(cache_key, resolved_payload)
+            if len(attempt_details) > 1:
+                log_provider(detect_provider(resolved_payload.get('sourceUrl') or url), f"fallback success attempts={len(attempt_details)}")
+            return jsonify(resolved_payload)
 
-        log_provider(requested_provider, f"all provider attempts failed count={len(attempted_urls)}")
+        log_provider(requested_provider, f"all provider attempts failed count={len(attempt_details)}")
         return jsonify({
             "success": False,
             "error": "Failed to extract raw video. Bot protection detected.",
-            "attemptedProviders": [detect_provider(item) for item in attempted_urls],
+            "attemptedProviders": [item["provider"] for item in attempt_details],
+            "attempts": attempt_details,
+            "raceMode": "sequential-first-success",
         }), 400
     except Exception as e:
         print(f"🔥 Critical Resolve Error: {e}")
