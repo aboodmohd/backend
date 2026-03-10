@@ -90,8 +90,6 @@ def stream_priority(candidate_url):
         score += 120
     if '/file2/' in lowered or '/proxy/file2/' in lowered:
         score += 95
-    if '%2ffile2%2f' in lowered or '%2fproxy%2ffile2%2f' in lowered:
-        score += 95
     if 'workers.dev/' in lowered:
         score += 45
     if 'master' in lowered:
@@ -112,9 +110,7 @@ def looks_like_stream_url(url):
     if not url:
         return False
     lowered = url.lower()
-    return any(token in lowered for token in STRICT_MEDIA_PATTERNS) or any(
-        token in lowered for token in ['%2ffile2%2f', '%2fproxy%2ffile2%2f', '%2fplaylist%2f', 'proxy/file2%2f']
-    )
+    return any(token in lowered for token in STRICT_MEDIA_PATTERNS)
 
 
 def is_playlist_response(url, content_type='', body=''):
@@ -204,11 +200,6 @@ def probe_stream_candidate(url, headers):
         return False
 
     provider = detect_provider(url)
-    lowered_url = url.lower()
-
-    if any(token in lowered_url for token in ['storm.vodvidl.site/proxy/file2%2f', '/proxy/file2%2f', '%2ffile2%2f']):
-        log_provider(provider, f"probe accepted heuristic url={short_url(url)}")
-        return True
 
     probe_headers = {
         'User-Agent': headers.get('User-Agent') or headers.get('user-agent') or 'Mozilla/5.0',
@@ -548,7 +539,6 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         return any(token in lowered for token in ['.m3u8', 'playlist', 'master', 'manifest', '/file2/', '/stream2/'])
 
     def try_extraction(is_mobile=False):
-        mode_label = 'Mobile' if is_mobile else 'Desktop'
         local_streams = []
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
@@ -560,7 +550,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 return
 
             language_name, language_code = infer_subtitle_language_from_label(label, candidate_url)
-            print(f"🗨️ [{mode_label}] Captured Subtitle: {candidate_url[:40]}...")
+            print(f"🗨️ Captured Subtitle: {candidate_url[:40]}...")
             local_subtitles.append({
                 "url": candidate_url,
                 "language": language_name,
@@ -580,20 +570,15 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             if is_new:
                 local_streams.append(candidate)
                 source_referer = candidate['headers'].get('Referer') or candidate['headers'].get('referer') or 'n/a'
-                log_provider(provider, f"[{mode_label}] captured candidate url={short_url(candidate_url)} referer={short_url(source_referer, 60)}")
+                log_provider(provider, f"captured candidate url={short_url(candidate_url)} referer={short_url(source_referer, 60)}")
 
             current_winner_score = stream_priority(local_winner.get('url'))
             candidate_score = stream_priority(candidate_url)
-            should_promote = (
-                force_winner
-                or not local_winner.get('url')
-                or candidate_score > current_winner_score
-                or (preferred_quality != 'Auto' and preferred_quality.replace('p', '') in candidate_url)
-            )
+            should_promote = force_winner or (preferred_quality != 'Auto' and preferred_quality.replace('p', '') in candidate_url)
 
             if should_promote and candidate_score >= current_winner_score:
                 local_winner.update(candidate)
-                log_provider(provider, f"[{mode_label}] promoted winner url={short_url(candidate_url)} force={force_winner}")
+                log_provider(provider, f"promoted winner url={short_url(candidate_url)} force={force_winner}")
 
             return is_high_priority_stream(candidate_url)
         
@@ -706,12 +691,12 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                             current_page_url = page.url
                             if not is_challenge_page(html, current_page_url):
                                 if attempt > 1:
-                                    log_provider(provider, f"[{mode_label}] challenge cleared mode={label} attempts={attempt} url={short_url(current_page_url)}")
+                                    log_provider(provider, f"challenge cleared mode={label} attempts={attempt} url={short_url(current_page_url)}")
                                 return
 
                             if attempt == 1:
-                                print(f"🛡️ [{mode_label}] Solving Challenge...")
-                                log_provider(provider, f"[{mode_label}] challenge detected mode={label} url={short_url(current_page_url)}")
+                                print(f"🛡️ Solving Challenge ({'Mobile' if is_mobile else 'Desktop'})...")
+                                log_provider(provider, f"challenge detected mode={label} url={short_url(current_page_url)}")
 
                             interact()
                             try:
@@ -721,9 +706,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                                 pass
                             page.wait_for_timeout(500)
 
-                        log_provider(provider, f"[{mode_label}] challenge persisted mode={label} final_url={short_url(page.url)}")
+                        log_provider(provider, f"challenge persisted mode={label} final_url={short_url(page.url)}")
                     except Exception as exc:
-                        log_provider(provider, f"[{mode_label}] challenge wait error mode={label} error={exc}")
+                        log_provider(provider, f"challenge wait error mode={label} error={exc}")
 
                 try:
                     # Clear session for 111Movies
@@ -810,33 +795,25 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
                 result = None
                 if is_url_video(local_winner["url"]):
-                    print(f"✅ [{mode_label}] Success: Captured Quality ({local_winner['url'][:40]}...)")
+                    print(f"✅ Success: Captured Quality ({local_winner['url'][:40]}...)")
                     local_winner["headers"]["Cookie"] = cookie_str
                     result = local_winner
                 else:
                     valid_streams = [s for s in local_streams if is_url_video(s['url'])]
                     if valid_streams:
                         result = max(valid_streams, key=lambda stream: stream_priority(stream['url']))
-                        print(f"✅ [{mode_label}] Success: Captured Valid Stream ({result['url'][:40]}...)")
+                        print(f"✅ Success: Captured Valid Stream ({result['url'][:40]}...)")
                         result["headers"]["Cookie"] = cookie_str
 
-                if not result and local_winner.get("url"):
-                    result = {
-                        "url": local_winner["url"],
-                        "headers": {**local_winner.get("headers", {}), "Cookie": cookie_str},
-                    }
-                    print(f"✅ [{mode_label}] Success: Falling Back To Winner ({result['url'][:40]}...)")
-
                 if result:
-                    log_provider(provider, f"[{mode_label}] returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
+                    log_provider(provider, f"returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
                     result["subtitles"] = local_subtitles
-                    result["mode"] = mode_label.lower()
                     return result
-                log_provider(provider, f"[{mode_label}] no playable stream found subtitles={len(local_subtitles)} candidates={len(local_streams)}")
+                log_provider(provider, f"no playable stream found subtitles={len(local_subtitles)} candidates={len(local_streams)}")
                     
         except Exception as e:
             print(f"❌ Playwright Error ({'Mobile' if is_mobile else 'Desktop'}): {e}")
-            log_provider(provider, f"[{mode_label}] playwright exception error={e}")
+            log_provider(provider, f"playwright exception mode={'mobile' if is_mobile else 'desktop'} error={e}")
         return None
 
     log_provider(provider, "launching desktop worker")
