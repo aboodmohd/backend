@@ -3,6 +3,7 @@ import requests
 import re
 import os
 import time
+import threading
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 import requests.packages.urllib3
@@ -29,6 +30,11 @@ STREAM_CACHE_TTL_SECONDS = int(os.getenv('STREAM_CACHE_TTL_SECONDS', '5400'))
 PLAYWRIGHT_PROXY_SERVER = os.getenv('PLAYWRIGHT_PROXY_SERVER', '').strip()
 PLAYWRIGHT_PROXY_USERNAME = os.getenv('PLAYWRIGHT_PROXY_USERNAME', '').strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.getenv('PLAYWRIGHT_PROXY_PASSWORD', '').strip()
+PLAYWRIGHT_LAUNCH_TIMEOUT_MS = int(os.getenv('PLAYWRIGHT_LAUNCH_TIMEOUT_MS', '15000'))
+PLAYWRIGHT_GOTO_TIMEOUT_MS = int(os.getenv('PLAYWRIGHT_GOTO_TIMEOUT_MS', '8000'))
+PLAYWRIGHT_WARMUP_TIMEOUT_MS = int(os.getenv('PLAYWRIGHT_WARMUP_TIMEOUT_MS', '6000'))
+PLAYWRIGHT_ENABLE_MOBILE_FALLBACK = os.getenv('PLAYWRIGHT_ENABLE_MOBILE_FALLBACK', 'false').strip().lower() == 'true'
+PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS = max(1, int(os.getenv('PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS', '1')))
 STREAM_HINT_KEYWORDS = [
     '.m3u8', '.mp4', '.m4v', '.ts', 'playlist', 'master', 'manifest',
     'worker', 'skylark', 'storm', 'vhls', 'vidfast', 'vidrock',
@@ -41,6 +47,11 @@ STRICT_MEDIA_PATTERNS = [
     'workers.dev/', 'videostr.net', 'vhls', '/v4/tab/', 'index.m3u8'
 ]
 PROVIDER_ORDER = ['vidlink', 'vidfast', '111movies', 'vidnest']
+
+PLAYWRIGHT_INSTANCE = None
+PLAYWRIGHT_BROWSER = None
+PLAYWRIGHT_START_LOCK = threading.Lock()
+PLAYWRIGHT_EXTRACTION_SEMAPHORE = threading.BoundedSemaphore(PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS)
 
 
 def short_url(url, limit=90):
@@ -158,6 +169,44 @@ def build_playwright_proxy_settings():
     if PLAYWRIGHT_PROXY_PASSWORD:
         proxy_config['password'] = PLAYWRIGHT_PROXY_PASSWORD
     return proxy_config
+
+
+def get_shared_browser(provider='generic'):
+    global PLAYWRIGHT_INSTANCE, PLAYWRIGHT_BROWSER
+
+    with PLAYWRIGHT_START_LOCK:
+        try:
+            if PLAYWRIGHT_BROWSER:
+                PLAYWRIGHT_BROWSER.version
+                return PLAYWRIGHT_BROWSER
+        except Exception:
+            PLAYWRIGHT_BROWSER = None
+
+        if PLAYWRIGHT_INSTANCE is None:
+            PLAYWRIGHT_INSTANCE = sync_playwright().start()
+
+        launch_options = {
+            'headless': True,
+            'chromium_sandbox': False,
+            'timeout': PLAYWRIGHT_LAUNCH_TIMEOUT_MS,
+            'args': [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+            ],
+        }
+        proxy_settings = build_playwright_proxy_settings()
+        if proxy_settings:
+            launch_options['proxy'] = proxy_settings
+            log_provider(provider, f"shared browser using upstream proxy={short_url(proxy_settings['server'], 40)}")
+
+        log_provider(provider, f"launching shared chromium timeoutMs={PLAYWRIGHT_LAUNCH_TIMEOUT_MS}")
+        PLAYWRIGHT_BROWSER = PLAYWRIGHT_INSTANCE.chromium.launch(**launch_options)
+        log_provider(provider, "shared chromium launched")
+        return PLAYWRIGHT_BROWSER
 
 
 def log_provider(provider, message):
@@ -706,6 +755,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         local_streams = []
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
+        browser = None
+        context = None
 
         def build_cookie_header(context):
             try:
@@ -733,10 +784,11 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 log_provider(provider, f"[{mode_label}] returning stream url={short_url(result['url'])} subtitles={len(local_subtitles)} candidates={len(local_streams)}")
 
             try:
-                browser.close()
-                log_provider(provider, f"[{mode_label}] browser closed")
+                if context:
+                    context.close()
+                    log_provider(provider, f"[{mode_label}] context closed")
             except Exception as exc:
-                log_provider(provider, f"[{mode_label}] browser close failed error={exc}")
+                log_provider(provider, f"[{mode_label}] context close failed error={exc}")
 
             return result
 
@@ -781,34 +833,18 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             return is_high_priority_stream(candidate_url)
         
         try:
-            with sync_playwright() as p:
+            acquired = PLAYWRIGHT_EXTRACTION_SEMAPHORE.acquire(timeout=max(5, int(PLAYWRIGHT_LAUNCH_TIMEOUT_MS / 1000)))
+            if not acquired:
+                log_provider(provider, f"[{mode_label}] extractor busy, skipping")
+                return None
+
+            try:
                 ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 if is_mobile: 
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
-                log_provider(provider, f"[{mode_label}] launching chromium")
-                launch_options = {
-                    'headless': True,
-                    'chromium_sandbox': False,
-                    'timeout': 45000,
-                    'args': [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer',
-                    ],
-                }
-                proxy_settings = build_playwright_proxy_settings()
-                if proxy_settings:
-                    launch_options['proxy'] = proxy_settings
-                    log_provider(provider, f"[{mode_label}] using upstream proxy={short_url(proxy_settings['server'], 40)}")
-
-                browser = p.chromium.launch(
-                    **launch_options
-                )
-                log_provider(provider, f"[{mode_label}] chromium launched")
+                browser = get_shared_browser(provider)
+                log_provider(provider, f"[{mode_label}] shared chromium ready")
                 
                 context_args = {
                     "user_agent": ua,
@@ -926,11 +962,10 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 try:
                     # Clear session for 111Movies
                     if '111movies' in url:
-                        page.goto('https://111movies.net', wait_until='domcontentloaded', timeout=8000); page.wait_for_timeout(500)
+                        page.goto('https://111movies.net', wait_until='domcontentloaded', timeout=PLAYWRIGHT_WARMUP_TIMEOUT_MS); page.wait_for_timeout(500)
                         wait_for_challenge_clear('warmup')
                     
-                    # 15s Timeout as per Ultimate Fix Blueprint
-                    page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                    page.goto(url, wait_until='domcontentloaded', timeout=PLAYWRIGHT_GOTO_TIMEOUT_MS)
                     page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
                 except: pass
@@ -1031,15 +1066,22 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     return finalize_result(context, browser, result, label)
 
                 try:
-                    browser.close()
-                    log_provider(provider, f"[{mode_label}] browser closed without result")
+                    if context:
+                        context.close()
+                        log_provider(provider, f"[{mode_label}] context closed without result")
                 except Exception as exc:
-                    log_provider(provider, f"[{mode_label}] browser close failed without result error={exc}")
+                    log_provider(provider, f"[{mode_label}] context close failed without result error={exc}")
                 log_provider(provider, f"[{mode_label}] no playable stream found subtitles={len(local_subtitles)} candidates={len(local_streams)}")
-                    
+            finally:
+                PLAYWRIGHT_EXTRACTION_SEMAPHORE.release()
         except Exception as e:
             print(f"❌ Playwright Error ({'Mobile' if is_mobile else 'Desktop'}): {e}")
             log_provider(provider, f"playwright exception mode={'mobile' if is_mobile else 'desktop'} error={e}")
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
         return None
 
     log_provider(provider, "launching desktop worker")
@@ -1049,12 +1091,15 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         log_provider(provider, f"worker Desktop WON with url={short_url(desktop_result['url'])}")
         return desktop_result
 
-    log_provider(provider, "desktop worker failed, launching mobile worker")
-    mobile_result = try_extraction(is_mobile=True)
-    if mobile_result and mobile_result.get('url'):
-        mobile_result["success"] = True
-        log_provider(provider, f"worker Mobile WON with url={short_url(mobile_result['url'])}")
-        return mobile_result
+    if PLAYWRIGHT_ENABLE_MOBILE_FALLBACK:
+        log_provider(provider, "desktop worker failed, launching mobile worker")
+        mobile_result = try_extraction(is_mobile=True)
+        if mobile_result and mobile_result.get('url'):
+            mobile_result["success"] = True
+            log_provider(provider, f"worker Mobile WON with url={short_url(mobile_result['url'])}")
+            return mobile_result
+    else:
+        log_provider(provider, "desktop worker failed, mobile fallback disabled")
 
     log_provider(provider, "both workers finished without a direct stream")
     return {"url": None, "headers": {}, "success": False, "subtitles": []}
