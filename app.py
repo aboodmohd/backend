@@ -35,6 +35,7 @@ PLAYWRIGHT_GOTO_TIMEOUT_MS = int(os.getenv('PLAYWRIGHT_GOTO_TIMEOUT_MS', '8000')
 PLAYWRIGHT_WARMUP_TIMEOUT_MS = int(os.getenv('PLAYWRIGHT_WARMUP_TIMEOUT_MS', '6000'))
 PLAYWRIGHT_ENABLE_MOBILE_FALLBACK = os.getenv('PLAYWRIGHT_ENABLE_MOBILE_FALLBACK', 'false').strip().lower() == 'true'
 PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS = max(1, int(os.getenv('PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS', '1')))
+PLAYWRIGHT_EXTRACTOR_WAIT_SECONDS = max(5, int(os.getenv('PLAYWRIGHT_EXTRACTOR_WAIT_SECONDS', '45')))
 STREAM_HINT_KEYWORDS = [
     '.m3u8', '.mp4', '.m4v', '.ts', 'playlist', 'master', 'manifest',
     'worker', 'skylark', 'storm', 'vhls', 'vidfast', 'vidrock',
@@ -48,10 +49,9 @@ STRICT_MEDIA_PATTERNS = [
 ]
 PROVIDER_ORDER = ['vidlink', 'vidfast', '111movies', 'vidnest']
 
-PLAYWRIGHT_INSTANCE = None
-PLAYWRIGHT_BROWSER = None
 PLAYWRIGHT_START_LOCK = threading.Lock()
 PLAYWRIGHT_EXTRACTION_SEMAPHORE = threading.BoundedSemaphore(PLAYWRIGHT_MAX_CONCURRENT_EXTRACTORS)
+PLAYWRIGHT_THREAD_LOCAL = threading.local()
 
 
 def short_url(url, limit=90):
@@ -172,18 +172,21 @@ def build_playwright_proxy_settings():
 
 
 def get_shared_browser(provider='generic'):
-    global PLAYWRIGHT_INSTANCE, PLAYWRIGHT_BROWSER
-
     with PLAYWRIGHT_START_LOCK:
-        try:
-            if PLAYWRIGHT_BROWSER:
-                PLAYWRIGHT_BROWSER.version
-                return PLAYWRIGHT_BROWSER
-        except Exception:
-            PLAYWRIGHT_BROWSER = None
+        playwright_instance = getattr(PLAYWRIGHT_THREAD_LOCAL, 'playwright_instance', None)
+        browser = getattr(PLAYWRIGHT_THREAD_LOCAL, 'browser', None)
 
-        if PLAYWRIGHT_INSTANCE is None:
-            PLAYWRIGHT_INSTANCE = sync_playwright().start()
+        try:
+            if browser:
+                browser.version
+                return browser
+        except Exception:
+            browser = None
+            PLAYWRIGHT_THREAD_LOCAL.browser = None
+
+        if playwright_instance is None:
+            playwright_instance = sync_playwright().start()
+            PLAYWRIGHT_THREAD_LOCAL.playwright_instance = playwright_instance
 
         launch_options = {
             'headless': True,
@@ -203,10 +206,11 @@ def get_shared_browser(provider='generic'):
             launch_options['proxy'] = proxy_settings
             log_provider(provider, f"shared browser using upstream proxy={short_url(proxy_settings['server'], 40)}")
 
-        log_provider(provider, f"launching shared chromium timeoutMs={PLAYWRIGHT_LAUNCH_TIMEOUT_MS}")
-        PLAYWRIGHT_BROWSER = PLAYWRIGHT_INSTANCE.chromium.launch(**launch_options)
+        log_provider(provider, f"launching thread-local chromium timeoutMs={PLAYWRIGHT_LAUNCH_TIMEOUT_MS}")
+        browser = playwright_instance.chromium.launch(**launch_options)
+        PLAYWRIGHT_THREAD_LOCAL.browser = browser
         log_provider(provider, "shared chromium launched")
-        return PLAYWRIGHT_BROWSER
+        return browser
 
 
 def log_provider(provider, message):
@@ -833,9 +837,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             return is_high_priority_stream(candidate_url)
         
         try:
-            acquired = PLAYWRIGHT_EXTRACTION_SEMAPHORE.acquire(timeout=max(5, int(PLAYWRIGHT_LAUNCH_TIMEOUT_MS / 1000)))
+            acquired = PLAYWRIGHT_EXTRACTION_SEMAPHORE.acquire(timeout=PLAYWRIGHT_EXTRACTOR_WAIT_SECONDS)
             if not acquired:
-                log_provider(provider, f"[{mode_label}] extractor busy, skipping")
+                log_provider(provider, f"[{mode_label}] extractor busy after {PLAYWRIGHT_EXTRACTOR_WAIT_SECONDS}s, skipping")
                 return None
 
             try:
