@@ -931,7 +931,13 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             if should_skip_candidate(candidate_url, url):
                 return
 
-            candidate = {"url": candidate_url, "headers": headers or {}}
+            normalized_headers = dict(headers or {})
+            if provider == '111movies':
+                target_referer = page.url if 'page' in locals() and page.url and page.url != 'about:blank' else url
+                normalized_headers['Referer'] = target_referer
+                normalized_headers['referer'] = target_referer
+
+            candidate = {"url": candidate_url, "headers": normalized_headers}
             is_new = not any(existing['url'] == candidate_url for existing in local_streams)
             if is_new:
                 local_streams.append(candidate)
