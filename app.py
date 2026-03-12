@@ -224,17 +224,34 @@ def looks_like_stream_url(url):
     return any(token in lowered for token in STRICT_MEDIA_PATTERNS)
 
 
-def is_playlist_response(url, content_type='', body=''):
-    lowered_type = (content_type or '').lower()
-    body_start = (body or '')[:512].lstrip()
+def looks_like_hls_manifest_body(body=''):
+    if not body:
+        return False
+
+    body_start = (body or '')[:2048].lstrip()
     return (
-        '.m3u8' in (url or '').lower()
-        or 'mpegurl' in lowered_type
-        or 'application/x-mpegurl' in lowered_type
-        or 'vnd.apple.mpegurl' in lowered_type
-        or body_start.startswith('#EXTM3U')
+        body_start.startswith('#EXTM3U')
         or '#EXTINF' in body_start
         or '#EXT-X-STREAM-INF' in body_start
+        or '#EXT-X-TARGETDURATION' in body_start
+        or '#EXT-X-MEDIA-SEQUENCE' in body_start
+    )
+
+
+def is_playlist_response(url, content_type='', body=''):
+    lowered_type = (content_type or '').lower()
+    lowered_url = (url or '').lower()
+    has_manifest_body = looks_like_hls_manifest_body(body)
+
+    if has_manifest_body:
+        return True
+
+    return (
+        '.m3u8' in lowered_url
+        or (
+            any(token in lowered_url for token in ['manifest', 'playlist', 'master'])
+            and ('mpegurl' in lowered_type or 'dash+xml' in lowered_type)
+        )
     )
 
 
@@ -339,6 +356,10 @@ def probe_stream_candidate(url, headers):
             return True
 
         lowered_type = content_type.lower()
+        if 'html' in lowered_type and not looks_like_hls_manifest_body(preview):
+            log_provider(provider, f"probe rejected html fallback url={short_url(url)}")
+            return False
+
         if 'application/json' in lowered_type:
             body = preview
             try:
