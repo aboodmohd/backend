@@ -864,6 +864,12 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         local_streams = []
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
+        capture_phase = 'target'
+
+        def should_capture_candidates():
+            if provider != '111movies':
+                return True
+            return capture_phase == 'target'
 
         def build_cookie_header(context):
             try:
@@ -899,6 +905,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             return result
 
         def remember_subtitle(candidate_url, label=''):
+            if not should_capture_candidates():
+                return
             resolved_url = resolve_candidate_url(candidate_url, page.url if 'page' in locals() else url)
             if not resolved_url or not looks_like_subtitle_url(resolved_url):
                 return
@@ -916,6 +924,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             })
 
         def remember_stream(candidate_url, headers=None, force_winner=False):
+            if not should_capture_candidates():
+                return False
             if not candidate_url:
                 return
             if should_skip_candidate(candidate_url, url):
@@ -1084,9 +1094,15 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 try:
                     # Clear session for 111Movies
                     if '111movies' in url:
+                        capture_phase = 'warmup'
                         page.goto('https://111movies.net', wait_until='domcontentloaded', timeout=8000); page.wait_for_timeout(500)
                         wait_for_challenge_clear('warmup')
-                    
+                        local_streams.clear()
+                        local_subtitles.clear()
+                        local_winner.update({"url": None, "headers": {}})
+                        log_provider(provider, f"[{mode_label}] cleared warmup candidates before target navigation")
+
+                    capture_phase = 'target'
                     page.goto(url, wait_until='domcontentloaded', timeout=10000)
                     page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
