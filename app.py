@@ -101,6 +101,26 @@ def build_provider_url(provider, target):
     return None
 
 
+def get_provider_fallback_urls(url):
+    if not url:
+        return []
+
+    fallbacks = []
+    lowered = url.lower()
+
+    if 'vidnest.fun/' in lowered:
+        fallbacks.append(url.replace('https://vidnest.fun/', 'https://vidlink.pro/'))
+        fallbacks.append(url.replace('http://vidnest.fun/', 'https://vidlink.pro/'))
+
+    deduped = []
+    seen = set()
+    for candidate in fallbacks:
+        if candidate and candidate not in seen and candidate != url:
+            seen.add(candidate)
+            deduped.append(candidate)
+    return deduped
+
+
 def expand_provider_urls(url, providers=None):
     target = parse_media_target(url)
     requested_provider = detect_provider(url)
@@ -1323,18 +1343,47 @@ def resolve_provider_candidate(candidate_url, preferred_quality):
     provider = detect_provider(candidate_url)
     log_provider(provider, f"attempting candidate quality={preferred_quality} url={short_url(candidate_url)}")
 
-    extracted = extract_stream_with_playwright(candidate_url, preferred_quality)
+    extraction_url = candidate_url
+    extracted = extract_stream_with_playwright(extraction_url, preferred_quality)
+
+    if not extracted.get('url'):
+        for fallback_url in get_provider_fallback_urls(candidate_url):
+            log_provider(provider, f"trying fallback url={short_url(fallback_url)} source={short_url(candidate_url)}")
+            extracted = extract_stream_with_playwright(fallback_url, preferred_quality)
+            if extracted.get('url'):
+                extraction_url = fallback_url
+                break
+
     curr_url = extracted.get('url')
     curr_headers = extracted.get('headers', {})
-    extracted['subtitles'] = enrich_extracted_subtitles(curr_url, curr_headers, candidate_url, extracted.get('subtitles', []))
+    extracted['subtitles'] = enrich_extracted_subtitles(curr_url, curr_headers, extraction_url, extracted.get('subtitles', []))
 
-    if not probe_stream_candidate(curr_url, curr_headers):
+    is_valid_video = probe_stream_candidate(curr_url, curr_headers)
+    if not is_valid_video:
+        for fallback_url in get_provider_fallback_urls(candidate_url):
+            if fallback_url == extraction_url:
+                continue
+            log_provider(provider, f"validation fallback url={short_url(fallback_url)} source={short_url(candidate_url)}")
+            fallback_extracted = extract_stream_with_playwright(fallback_url, preferred_quality)
+            fallback_curr_url = fallback_extracted.get('url')
+            fallback_curr_headers = fallback_extracted.get('headers', {})
+            if not probe_stream_candidate(fallback_curr_url, fallback_curr_headers):
+                continue
+            extraction_url = fallback_url
+            extracted = fallback_extracted
+            curr_url = fallback_curr_url
+            curr_headers = fallback_curr_headers
+            extracted['subtitles'] = enrich_extracted_subtitles(curr_url, curr_headers, extraction_url, fallback_extracted.get('subtitles', []))
+            is_valid_video = True
+            break
+
+    if not is_valid_video:
         log_provider(provider, f"validation failed extracted={short_url(curr_url)}")
         return None
 
     prov_keywords = ['workers.dev', 'vidrock', 'vidfast', 'vidnest', 'vhls', 'm3u8-proxy', '111movies']
-    should_proxy = any(kw in (curr_url or '').lower() for kw in prov_keywords) or any(kw in candidate_url.lower() for kw in prov_keywords)
-    referer = curr_headers.get('referer', '') or curr_headers.get('Referer', '') or candidate_url
+    should_proxy = any(kw in (curr_url or '').lower() for kw in prov_keywords) or any(kw in extraction_url.lower() for kw in prov_keywords)
+    referer = curr_headers.get('referer', '') or curr_headers.get('Referer', '') or extraction_url
     cookie = curr_headers.get('Cookie', '') or curr_headers.get('cookie', '')
 
     response_payload = {
@@ -1342,8 +1391,8 @@ def resolve_provider_candidate(candidate_url, preferred_quality):
         "url": build_proxy_url(request.host, curr_url, referer, cookie) if should_proxy else curr_url,
         "headers": curr_headers,
         "subtitles": extracted.get('subtitles', []),
-        "provider": provider,
-        "sourceUrl": candidate_url,
+        "provider": detect_provider(extraction_url),
+        "sourceUrl": extraction_url,
     }
 
     if should_proxy:
