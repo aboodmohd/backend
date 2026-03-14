@@ -648,6 +648,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     }
                 }
                 context = browser.new_context(**context_args)
+                log_provider(provider, f"[{mode_label}] browser context created")
+                context.set_default_timeout(8000 if provider == '111movies' else 10000)
+                context.set_default_navigation_timeout(8000 if provider == '111movies' else 10000)
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                     Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
@@ -665,6 +668,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     else route.continue_()
                 )
                 page = context.new_page()
+                log_provider(provider, f"[{mode_label}] page created")
 
                 def inspect_possible_stream_url(candidate_url, headers=None, label=''):
                     if not candidate_url:
@@ -800,8 +804,10 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
                 try:
                     if profile.warmup_url:
+                        log_provider(provider, f"[{mode_label}] warmup navigation start url={short_url(profile.warmup_url)}")
                         capture_phase = 'warmup'
                         page.goto(profile.warmup_url, wait_until='domcontentloaded', timeout=profile.warmup_timeout_ms); page.wait_for_timeout(500)
+                        log_provider(provider, f"[{mode_label}] warmup navigation done url={short_url(page.url)}")
                         wait_for_challenge_clear('warmup')
                         local_streams.clear()
                         local_subtitles.clear()
@@ -809,7 +815,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         log_provider(provider, f"[{mode_label}] cleared warmup candidates before target navigation")
 
                     capture_phase = 'target'
+                    log_provider(provider, f"[{mode_label}] target navigation start url={short_url(url)}")
                     page.goto(url, wait_until='domcontentloaded', timeout=profile.target_timeout_ms)
+                    log_provider(provider, f"[{mode_label}] target navigation done url={short_url(page.url)}")
                     page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
                 except: pass
