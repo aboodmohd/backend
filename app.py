@@ -180,6 +180,12 @@ def build_playwright_proxy_settings():
     return proxy_config
 
 
+def can_launch_headed_browser():
+    if os.getenv('PLAYWRIGHT_FORCE_HEADED', '').strip().lower() in {'1', 'true', 'yes'}:
+        return True
+    return bool(os.getenv('DISPLAY', '').strip() or os.getenv('WAYLAND_DISPLAY', '').strip())
+
+
 def log_provider(provider, message):
     print(f"🔎 [{provider}] {message}")
 
@@ -987,7 +993,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
                 log_provider(provider, f"[{mode_label}] launching chromium")
-                use_headed_browser = provider == '111movies'
+                use_headed_browser = provider == '111movies' and can_launch_headed_browser()
                 launch_options = {
                     'headless': not use_headed_browser,
                     'chromium_sandbox': False,
@@ -1003,6 +1009,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 }
                 if use_headed_browser:
                     log_provider(provider, f"[{mode_label}] using headed browser to avoid Cloudflare challenge")
+                elif provider == '111movies':
+                    log_provider(provider, f"[{mode_label}] headed browser unavailable, staying headless")
                 proxy_settings = build_playwright_proxy_settings()
                 if proxy_settings:
                     launch_options['proxy'] = proxy_settings
