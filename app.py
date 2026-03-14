@@ -867,6 +867,9 @@ def fetch_subtitles_from_subdl(tmdb_id, media_type, season=None, episode=None, l
 def extract_stream_with_playwright(url, preferred_quality='Auto'):
     provider = detect_provider(url)
     log_provider(provider, f"starting extraction quality={preferred_quality}")
+    worker_order = [('Desktop', False), ('Mobile', True)]
+    if provider == 'vidfast':
+        worker_order = [('Mobile', True), ('Desktop', False)]
     
     BLOCK_DOMAINS = ["adscore", "dtscout", "doubleclick", "analytics", "clarity", "histats", "onclick", "popunder", "exoclick", "juicyads", "popcash", "jads.co"]
     SUCCESS_KEYWORDS = STREAM_HINT_KEYWORDS
@@ -1240,19 +1243,17 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
             log_provider(provider, f"playwright exception mode={'mobile' if is_mobile else 'desktop'} error={e}")
         return None
 
-    log_provider(provider, "launching desktop worker")
-    desktop_result = try_extraction(is_mobile=False)
-    if desktop_result and desktop_result.get('url'):
-        desktop_result["success"] = True
-        log_provider(provider, f"worker Desktop WON with url={short_url(desktop_result['url'])}")
-        return desktop_result
+    for index, (label, is_mobile) in enumerate(worker_order):
+        if index == 0:
+            log_provider(provider, f"launching {label.lower()} worker")
+        else:
+            log_provider(provider, f"{worker_order[index - 1][0].lower()} worker failed, launching {label.lower()} worker")
 
-    log_provider(provider, "desktop worker failed, launching mobile worker")
-    mobile_result = try_extraction(is_mobile=True)
-    if mobile_result and mobile_result.get('url'):
-        mobile_result["success"] = True
-        log_provider(provider, f"worker Mobile WON with url={short_url(mobile_result['url'])}")
-        return mobile_result
+        result = try_extraction(is_mobile=is_mobile)
+        if result and result.get('url'):
+            result["success"] = True
+            log_provider(provider, f"worker {label} WON with url={short_url(result['url'])}")
+            return result
 
     log_provider(provider, "both workers finished without a direct stream")
     return {"url": None, "headers": {}, "success": False, "subtitles": []}
