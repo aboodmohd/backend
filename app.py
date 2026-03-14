@@ -836,6 +836,17 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         page.keyboard.press("Enter")
                     except: pass
 
+                def wait_for_player_iframe():
+                    if not profile.iframe_selectors or profile.iframe_wait_timeout_ms <= 0:
+                        return
+                    for selector in profile.iframe_selectors:
+                        try:
+                            page.wait_for_selector(selector, timeout=profile.iframe_wait_timeout_ms)
+                            log_provider(provider, f"[{mode_label}] iframe detected selector={selector}")
+                            break
+                        except Exception:
+                            continue
+
                 def wait_for_challenge_clear(label):
                     try:
                         for attempt in range(1, profile.challenge_attempts + 1):
@@ -882,6 +893,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     log_provider(provider, f"[{mode_label}] target navigation start url={short_url(url)}")
                     page.goto(url, wait_until='domcontentloaded', timeout=profile.target_timeout_ms)
                     log_provider(provider, f"[{mode_label}] target navigation done url={short_url(page.url)}")
+                    if profile.pre_capture_wait_ms > 0:
+                        page.wait_for_timeout(profile.pre_capture_wait_ms)
+                    wait_for_player_iframe()
                     page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
                 except: pass

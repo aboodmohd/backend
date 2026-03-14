@@ -17,5 +17,8 @@ class ProviderProfile:
     extra_scroll_attempts: tuple = field(default_factory=tuple)
     challenge_attempts: int = 8
     challenge_wait_ms: int = 250
+    pre_capture_wait_ms: int = 0
+    iframe_wait_timeout_ms: int = 0
+    iframe_selectors: tuple = field(default_factory=tuple)
     desktop_user_agents: tuple = field(default_factory=tuple)
     mobile_user_agents: tuple = field(default_factory=tuple)
