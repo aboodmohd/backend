@@ -61,6 +61,7 @@ STREAM_CACHE_TTL_SECONDS = int(os.getenv('STREAM_CACHE_TTL_SECONDS', '5400'))
 PLAYWRIGHT_PROXY_SERVER = os.getenv('PLAYWRIGHT_PROXY_SERVER', '').strip()
 PLAYWRIGHT_PROXY_USERNAME = os.getenv('PLAYWRIGHT_PROXY_USERNAME', '').strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.getenv('PLAYWRIGHT_PROXY_PASSWORD', '').strip()
+PLAYWRIGHT_SESSION_COOKIES = {}
 
 
 def build_stream_cache_key(url, preferred_quality, providers=None):
@@ -103,6 +104,20 @@ def can_launch_headed_browser():
     if os.getenv('PLAYWRIGHT_FORCE_HEADED', '').strip().lower() in {'1', 'true', 'yes'}:
         return True
     return bool(os.getenv('DISPLAY', '').strip() or os.getenv('WAYLAND_DISPLAY', '').strip())
+
+
+def get_session_cookie_key(provider, mode_label):
+    return f"{(provider or 'generic').lower()}:{(mode_label or 'desktop').lower()}"
+
+
+def get_profile_user_agent(profile, is_mobile, url):
+    candidates = profile.mobile_user_agents if is_mobile else profile.desktop_user_agents
+    if not candidates:
+        if is_mobile:
+            return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    seed = sum(ord(ch) for ch in ((url or '') + ('mobile' if is_mobile else 'desktop')))
+    return candidates[seed % len(candidates)]
 
 
 def log_provider(provider, message):
@@ -503,6 +518,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
     def try_extraction(is_mobile=False):
         mode_label = 'Mobile' if is_mobile else 'Desktop'
+        session_cookie_key = get_session_cookie_key(provider, mode_label)
         local_streams = []
         local_subtitles = []
         local_winner = {"url": None, "headers": {}}
@@ -531,6 +547,11 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
         def finalize_result(context, browser, result, success_label):
             cookie_str = build_cookie_header(context)
+            if profile.reuse_session:
+                try:
+                    PLAYWRIGHT_SESSION_COOKIES[session_cookie_key] = context.cookies()
+                except Exception:
+                    pass
             if result is not None:
                 result.setdefault("headers", {})["Cookie"] = cookie_str
                 result["subtitles"] = local_subtitles
@@ -598,9 +619,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         
         try:
             with sync_playwright() as p:
-                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                if is_mobile: 
-                    ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+                ua = get_profile_user_agent(profile, is_mobile, url)
                 
                 log_provider(provider, f"[{mode_label}] launching chromium")
                 use_headed_browser = profile.use_headed_browser and can_launch_headed_browser()
@@ -649,6 +668,14 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 }
                 context = browser.new_context(**context_args)
                 log_provider(provider, f"[{mode_label}] browser context created")
+                if profile.reuse_session:
+                    stored_cookies = PLAYWRIGHT_SESSION_COOKIES.get(session_cookie_key, [])
+                    if stored_cookies:
+                        try:
+                            context.add_cookies(stored_cookies)
+                            log_provider(provider, f"[{mode_label}] restored cookies count={len(stored_cookies)}")
+                        except Exception as exc:
+                            log_provider(provider, f"[{mode_label}] cookie restore failed error={exc}")
                 context.set_default_timeout(8000 if provider == '111movies' else 10000)
                 context.set_default_navigation_timeout(8000 if provider == '111movies' else 10000)
                 context.add_init_script("""
@@ -658,7 +685,10 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
                     Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    Object.defineProperty(navigator, 'mimeTypes', { get: () => [1, 2, 3] });
                     window.chrome = window.chrome || { runtime: {} };
+                    window.Notification = window.Notification || { permission: 'default' };
                 """)
                 context.route(
                     "**/*",
@@ -709,6 +739,16 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                             except Exception:
                                 pass
 
+                        if provider == 'vidnest' and any(token in lowered_type for token in ['text/html', 'application/json', 'javascript']):
+                            try:
+                                body = response.text()
+                                for subtitle in extract_subtitles_from_text(body, r_url):
+                                    remember_subtitle(subtitle.get('url'), subtitle.get('label', ''))
+                                for match in re.findall(r'https?://[^"\'\s<>()]+', body or ''):
+                                    inspect_possible_stream_url(match, {"Referer": r_url})
+                            except Exception:
+                                pass
+
                         if is_playlist_response(r_url, content_type) or content_type.lower().startswith('video/'):
                             headers = dict(response.request.headers)
                             headers['Accept'] = headers.get('Accept', '*/*')
@@ -726,6 +766,19 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     except Exception:
                         pass
 
+                def handle_frame_attached(frame):
+                    try:
+                        frame.wait_for_load_state('domcontentloaded', timeout=4000)
+                    except Exception:
+                        pass
+                    try:
+                        inspect_possible_stream_url(frame.url, {"Referer": page.url})
+                        html = frame.content()
+                        for match in re.findall(r'https?://[^"\'\s<>()]+', html or ''):
+                            inspect_possible_stream_url(match, {"Referer": frame.url or page.url})
+                    except Exception:
+                        pass
+
                 def handle_popup(popup):
                     try:
                         popup.wait_for_load_state('domcontentloaded', timeout=5000)
@@ -739,6 +792,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 page.on("request", handle_request)
                 page.on("response", handle_response)
                 page.on("framenavigated", handle_frame_navigation)
+                page.on("frameattached", handle_frame_attached)
                 page.on("popup", handle_popup)
 
                 def interact():
@@ -774,7 +828,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
 
                 def wait_for_challenge_clear(label):
                     try:
-                        for attempt in range(1, 9):
+                        for attempt in range(1, profile.challenge_attempts + 1):
                             if is_url_video(local_winner.get("url")) or any(is_url_video(item.get('url')) for item in local_streams):
                                 log_provider(provider, f"challenge short-circuited mode={label} attempt={attempt} winner={short_url(local_winner.get('url'))}")
                                 return
@@ -796,7 +850,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                                 page.mouse.wheel(0, 400)
                             except Exception:
                                 pass
-                            page.wait_for_timeout(250)
+                            page.wait_for_timeout(profile.challenge_wait_ms)
 
                         log_provider(provider, f"challenge persisted mode={label} final_url={short_url(page.url)}")
                     except Exception as exc:
