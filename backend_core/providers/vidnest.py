@@ -4,9 +4,8 @@ from .base import ProviderProfile
 PROFILE = ProviderProfile(
     name='vidnest',
     allow_media_requests=True,
-    use_headed_browser=True,
-    warmup_url='https://vidnest.fun',
-    warmup_timeout_ms=6000,
+    use_headed_browser=False,
+    warmup_url=None,
     discovery_loops=6,
     discovery_delay_ms=500,
     force_interact_each_loop=True,
