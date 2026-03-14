@@ -527,6 +527,10 @@ def infer_subtitle_language_from_label(label, fallback_url=''):
 
 def looks_like_subtitle_url(url):
     lowered = (url or '').lower()
+    if any(lowered.endswith(ext) for ext in ['.js', '.mjs', '.css', '.map']):
+        return False
+    if '/ui/subtitles/' in lowered or '/utils/subtitle' in lowered or '/options/defaults/' in lowered:
+        return False
     return any(token in lowered for token in ['.vtt', '.srt', '.ass', '.ssa', 'subtitle', '/sub/', 'captions', 'texttrack'])
 
 
