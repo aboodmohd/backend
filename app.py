@@ -11,6 +11,38 @@ import json
 import uuid
 import zipfile
 from urllib.parse import urlencode, urljoin, quote
+from backend_core.provider_config import (
+    PROVIDER_ORDER,
+    STREAM_HINT_KEYWORDS,
+    STRICT_MEDIA_PATTERNS,
+    build_provider_url,
+    detect_provider,
+    expand_provider_urls,
+    get_provider_fallback_urls,
+    parse_media_target,
+)
+from backend_core.providers import get_provider_profile
+from backend_core.stream_utils import (
+    is_challenge_page,
+    is_playlist_response,
+    looks_like_hls_manifest_body,
+    looks_like_stream_url as base_looks_like_stream_url,
+    resolve_candidate_url,
+    short_url,
+    should_skip_candidate,
+    stream_priority,
+)
+from backend_core.subtitle_utils import (
+    dedupe_subtitles,
+    extract_subtitle_candidates_from_json_payload,
+    extract_subtitles_from_m3u8,
+    extract_subtitles_from_text,
+    infer_subtitle_language_from_label,
+    looks_like_subtitle_url,
+    normalize_language_code,
+    normalize_subsource_language,
+    normalize_subtitle_entry,
+)
 requests.packages.urllib3.disable_warnings()
 
 app = Flask(__name__)
@@ -29,119 +61,6 @@ STREAM_CACHE_TTL_SECONDS = int(os.getenv('STREAM_CACHE_TTL_SECONDS', '5400'))
 PLAYWRIGHT_PROXY_SERVER = os.getenv('PLAYWRIGHT_PROXY_SERVER', '').strip()
 PLAYWRIGHT_PROXY_USERNAME = os.getenv('PLAYWRIGHT_PROXY_USERNAME', '').strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.getenv('PLAYWRIGHT_PROXY_PASSWORD', '').strip()
-STREAM_HINT_KEYWORDS = [
-    '.m3u8', '.mp4', '.m4v', '.ts', 'playlist', 'master', 'manifest',
-    'worker', 'skylark', 'storm', 'vhls', 'vidfast', 'vidrock',
-    '111movies', 'skyember', 'videostr.net', 'master.json', 'cf-master',
-    'hls', '/v4/tab/'
-]
-STRICT_MEDIA_PATTERNS = [
-    '.m3u8', '.mp4', '.m4v', '.ts', '/playlist/', 'playlist/', 'master', 'manifest',
-    'master.json', 'cf-master', '/stream2/', '/vod/', '/file2/', '/proxy/file2/',
-    'workers.dev/', 'videostr.net', 'vhls', '/v4/tab/', 'index.m3u8'
-]
-PROVIDER_ORDER = ['vidlink', 'vidfast', '111movies', 'vidnest']
-
-
-def short_url(url, limit=90):
-    if not url:
-        return 'None'
-    return url if len(url) <= limit else f"{url[:limit]}..."
-
-
-def detect_provider(url):
-    lowered = (url or '').lower()
-    for provider in ['vidlink', 'vidfast', 'vidrock', '111movies', 'vidnest']:
-        if provider in lowered:
-            return provider
-    return 'generic'
-
-
-def parse_media_target(url):
-    movie_match = re.search(r'/movie/(\d+)', url or '', re.IGNORECASE)
-    if movie_match:
-        return {'type': 'movie', 'tmdb_id': movie_match.group(1)}
-
-    tv_match = re.search(r'/tv/(\d+)/(\d+)/(\d+)', url or '', re.IGNORECASE)
-    if tv_match:
-        return {
-            'type': 'tv',
-            'tmdb_id': tv_match.group(1),
-            'season': tv_match.group(2),
-            'episode': tv_match.group(3),
-        }
-
-    return None
-
-
-def build_provider_url(provider, target):
-    if not target:
-        return None
-
-    if target['type'] == 'movie':
-        if provider == 'vidlink':
-            return f"https://vidlink.pro/movie/{target['tmdb_id']}"
-        if provider == 'vidfast':
-            return f"https://vidfast.pro/movie/{target['tmdb_id']}?autoPlay=true"
-        if provider == '111movies':
-            return f"https://111movies.net/movie/{target['tmdb_id']}"
-        if provider == 'vidnest':
-            return f"https://vidnest.fun/movie/{target['tmdb_id']}"
-
-    if target['type'] == 'tv':
-        if provider == 'vidlink':
-            return f"https://vidlink.pro/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
-        if provider == 'vidfast':
-            return f"https://vidfast.pro/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}?autoPlay=true"
-        if provider == '111movies':
-            return f"https://111movies.net/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
-        if provider == 'vidnest':
-            return f"https://vidnest.fun/tv/{target['tmdb_id']}/{target['season']}/{target['episode']}"
-
-    return None
-
-
-def get_provider_fallback_urls(url):
-    if not url:
-        return []
-
-    fallbacks = []
-    lowered = url.lower()
-
-    if 'vidnest.fun/' in lowered:
-        fallbacks.append(url.replace('https://vidnest.fun/', 'https://vidlink.pro/'))
-        fallbacks.append(url.replace('http://vidnest.fun/', 'https://vidlink.pro/'))
-
-    deduped = []
-    seen = set()
-    for candidate in fallbacks:
-        if candidate and candidate not in seen and candidate != url:
-            seen.add(candidate)
-            deduped.append(candidate)
-    return deduped
-
-
-def expand_provider_urls(url, providers=None):
-    target = parse_media_target(url)
-    requested_provider = detect_provider(url)
-    normalized_providers = []
-    for provider in providers or []:
-        lowered = (provider or '').strip().lower()
-        if lowered and lowered not in normalized_providers:
-            normalized_providers.append(lowered)
-
-    ordered_providers = normalized_providers or [requested_provider] + [provider for provider in PROVIDER_ORDER if provider != requested_provider]
-
-    candidates = []
-    seen = set()
-
-    for candidate_url in [url] + [build_provider_url(provider, target) for provider in ordered_providers]:
-        if not candidate_url or candidate_url in seen:
-            continue
-        seen.add(candidate_url)
-        candidates.append(candidate_url)
-
-    return candidates
 
 
 def build_stream_cache_key(url, preferred_quality, providers=None):
@@ -190,96 +109,8 @@ def log_provider(provider, message):
     print(f"🔎 [{provider}] {message}")
 
 
-def is_challenge_page(html, current_url=''):
-    content = ((html or '') + ' ' + (current_url or '')).lower()
-    checks = [
-        'checking your browser', 'verify you are human', 'just a moment',
-        'attention required',
-        'cf-browser-verification', 'cf-challenge', 'cloudflare', '/cdn-cgi/challenge-platform/'
-    ]
-    return any(token in content for token in checks)
-
-
-def should_skip_candidate(candidate_url, page_url=''):
-    lowered = (candidate_url or '').lower()
-    page_lowered = (page_url or '').lower()
-
-    blocked_parts = [
-        '/cdn-cgi/', 'cf.errors.css', 'browser-bar.png', 'cf-no-screenshot-error.png',
-        '/assets/', '.css', '.js', 'hls.min.js', '/rum?', '.woff', '.woff2',
-        'google-analytics.com/', 'umami.', '/api/send', 'demo-video.mp4'
-    ]
-    if any(part in lowered for part in blocked_parts):
-        return True
-
-    if lowered == page_lowered or lowered.rstrip('/') == page_lowered.rstrip('/'):
-        return True
-
-    return False
-
-
-def stream_priority(candidate_url):
-    lowered = (candidate_url or '').lower()
-    score = 0
-
-    if 'playlist' in lowered or '.m3u8' in lowered or 'manifest' in lowered:
-        score += 100
-    if '/playlist/' in lowered or 'hls2.vdrk.site/' in lowered or '.vdrk.site/' in lowered:
-        score += 120
-    if '/file2/' in lowered or '/proxy/file2/' in lowered:
-        score += 95
-    if 'workers.dev/' in lowered:
-        score += 45
-    if 'master' in lowered:
-        score += 90
-    if '.mp4' in lowered:
-        score += 70
-    if '.ts' in lowered:
-        score += 40
-    if 'demo-video' in lowered:
-        score -= 500
-    if any(part in lowered for part in ['/cdn-cgi/', '.css', '.js', '/assets/']):
-        score -= 200
-
-    return score
-
-
 def looks_like_stream_url(url):
-    if not url:
-        return False
-    lowered = url.lower()
-    return any(token in lowered for token in STRICT_MEDIA_PATTERNS)
-
-
-def looks_like_hls_manifest_body(body=''):
-    if not body:
-        return False
-
-    body_start = (body or '')[:2048].lstrip()
-    return (
-        body_start.startswith('#EXTM3U')
-        or '#EXTINF' in body_start
-        or '#EXT-X-STREAM-INF' in body_start
-        or '#EXT-X-TARGETDURATION' in body_start
-        or '#EXT-X-MEDIA-SEQUENCE' in body_start
-    )
-
-
-def is_playlist_response(url, content_type='', body=''):
-    lowered_type = (content_type or '').lower()
-    lowered_url = (url or '').lower()
-    has_manifest_body = looks_like_hls_manifest_body(body)
-
-    if has_manifest_body:
-        return True
-
-    return (
-        '.m3u8' in lowered_url
-        or (
-            any(token in lowered_url for token in ['manifest', 'playlist', 'master'])
-            and ('mpegurl' in lowered_type or 'dash+xml' in lowered_type)
-        )
-    )
+    return base_looks_like_stream_url(url, STRICT_MEDIA_PATTERNS)
 
 
 def build_proxy_url(host, target_url, referer='', cookie=''):
@@ -446,199 +277,6 @@ def cache_subtitle_content(content, filename):
     return token, extension
 
 
-def normalize_subsource_language(language):
-    mapping = {
-        'EN': 'english',
-        'AR': 'arabic',
-        'ENGLISH': 'english',
-        'ARABIC': 'arabic',
-    }
-    return mapping.get((language or '').strip().upper())
-
-
-def normalize_language_code(language_name):
-    lowered = (language_name or '').strip().lower()
-    if lowered == 'english':
-        return 'EN'
-    if lowered == 'arabic':
-        return 'AR'
-    return (language_name or 'UN')[:2].upper()
-
-
-def infer_subtitle_language_from_url(url):
-    lowered = (url or '').lower()
-    if any(token in lowered for token in ['arabic', '/ar/', '_ar', '-ar', '.ar.', 'lang=ar']):
-        return 'Arabic', 'AR'
-    if any(token in lowered for token in ['english', '/en/', '_en', '-en', '.en.', 'lang=en']):
-        return 'English', 'EN'
-    return 'Default', 'UN'
-
-
-def infer_subtitle_language_from_code(code):
-    normalized = (code or '').strip().lower().replace('_', '-').split('-')[0]
-    mapping = {
-        'en': ('English', 'EN'),
-        'ar': ('Arabic', 'AR'),
-        'es': ('Spanish', 'ES'),
-        'fr': ('French', 'FR'),
-        'de': ('German', 'DE'),
-        'it': ('Italian', 'IT'),
-        'pt': ('Portuguese', 'PT'),
-        'tr': ('Turkish', 'TR'),
-        'ru': ('Russian', 'RU'),
-        'hi': ('Hindi', 'HI'),
-        'id': ('Indonesian', 'ID'),
-        'ms': ('Malay', 'MS'),
-        'th': ('Thai', 'TH'),
-        'vi': ('Vietnamese', 'VI'),
-        'ko': ('Korean', 'KO'),
-        'ja': ('Japanese', 'JA'),
-        'zh': ('Chinese', 'ZH'),
-        'pl': ('Polish', 'PL'),
-        'nl': ('Dutch', 'NL'),
-        'sv': ('Swedish', 'SV'),
-        'no': ('Norwegian', 'NO'),
-        'da': ('Danish', 'DA'),
-        'fi': ('Finnish', 'FI'),
-        'uk': ('Ukrainian', 'UK'),
-        'fa': ('Persian', 'FA'),
-        'he': ('Hebrew', 'HE'),
-    }
-    return mapping.get(normalized)
-
-
-def infer_subtitle_language_from_label(label, fallback_url=''):
-    lowered = (label or '').strip().lower()
-    code_guess = infer_subtitle_language_from_code(lowered)
-    if code_guess:
-        return code_guess
-    if any(token in lowered for token in ['arabic', ' arabic', ' ar', '[ar]', '(ar)', 'ara']):
-        return 'Arabic', 'AR'
-    if any(token in lowered for token in ['english', ' eng', ' en', '[en]', '(en)']):
-        return 'English', 'EN'
-    if any(token in lowered for token in ['spanish', ' esp', ' es', '[es]', '(es)', 'spa']):
-        return 'Spanish', 'ES'
-    if any(token in lowered for token in ['french', ' fr', '[fr]', '(fr)', 'fre', 'fra']):
-        return 'French', 'FR'
-    if any(token in lowered for token in ['german', ' de', '[de]', '(de)', 'ger', 'deu']):
-        return 'German', 'DE'
-    return infer_subtitle_language_from_url(fallback_url)
-
-
-def looks_like_subtitle_url(url):
-    lowered = (url or '').lower()
-    if any(lowered.endswith(ext) for ext in ['.js', '.mjs', '.css', '.map']):
-        return False
-    if '/ui/subtitles/' in lowered or '/utils/subtitle' in lowered or '/options/defaults/' in lowered:
-        return False
-    return any(token in lowered for token in ['.vtt', '.srt', '.ass', '.ssa', 'subtitle', '/sub/', 'captions', 'texttrack'])
-
-
-def resolve_candidate_url(candidate_url, base_url):
-    if not candidate_url:
-        return None
-    if isinstance(candidate_url, str) and candidate_url.startswith(('http://', 'https://')):
-        return candidate_url
-    try:
-        return urljoin(base_url, candidate_url)
-    except Exception:
-        return candidate_url
-
-
-def normalize_subtitle_entry(candidate_url, label='', provider='embed'):
-    resolved_url = (candidate_url or '').strip()
-    if not resolved_url:
-        return None
-
-    language_name, language_code = infer_subtitle_language_from_label(label, resolved_url)
-    return {
-        'url': resolved_url,
-        'language': language_name,
-        'languageCode': language_code,
-        'provider': provider,
-        'label': label or language_name,
-    }
-
-
-def dedupe_subtitles(items):
-    deduped = []
-    seen = set()
-
-    for item in items or []:
-        if not item or not item.get('url'):
-            continue
-
-        key = item['url'].strip()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        deduped.append(item)
-
-    return deduped
-
-
-def extract_subtitles_from_text(content, base_url=''):
-    if not content:
-        return []
-
-    candidates = []
-    absolute_pattern = re.compile(r'https?://[^"\'\s<>()]+?(?:\.vtt|\.srt|\.ass|\.ssa)(?:\?[^"\'\s<>()]*)?', re.IGNORECASE)
-    relative_pattern = re.compile(r'(["\'])(/[^"\'\s<>()]+?(?:\.vtt|\.srt|\.ass|\.ssa)(?:\?[^"\'\s<>()]*)?)\1', re.IGNORECASE)
-    track_pattern = re.compile(
-        r'<track[^>]+src=["\']([^"\']+)["\'][^>]*?(?:label=["\']([^"\']*)["\'])?[^>]*?>',
-        re.IGNORECASE,
-    )
-    loose_track_pattern = re.compile(
-        r'(?:file|src|url)\s*[:=]\s*["\']([^"\']+?(?:\.vtt|\.srt|\.ass|\.ssa)(?:\?[^"\']*)?)["\'][^\n\r{}]*?(?:label|language|lang|srclang)?\s*[:=]?\s*["\']?([^"\',}\]]*)',
-        re.IGNORECASE,
-    )
-
-    for match in absolute_pattern.finditer(content):
-        candidates.append(normalize_subtitle_entry(match.group(0), provider='embed'))
-
-    if base_url:
-        for match in relative_pattern.finditer(content):
-            candidates.append(normalize_subtitle_entry(urljoin(base_url, match.group(2)), provider='embed'))
-
-    for match in track_pattern.finditer(content):
-        candidate_url = resolve_candidate_url(match.group(1), base_url)
-        label = match.group(2) or ''
-        if candidate_url:
-            candidates.append(normalize_subtitle_entry(candidate_url, label=label, provider='embed'))
-
-    for match in loose_track_pattern.finditer(content):
-        candidate_url = resolve_candidate_url(match.group(1), base_url)
-        label = (match.group(2) or '').strip(' :,-')
-        if candidate_url:
-            candidates.append(normalize_subtitle_entry(candidate_url, label=label, provider='embed'))
-
-    return dedupe_subtitles(candidates)
-
-
-def extract_subtitles_from_m3u8(content, manifest_url):
-    if not content or '#EXTM3U' not in content:
-        return []
-
-    subtitles = []
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line.startswith('#EXT-X-MEDIA:') or 'TYPE=SUBTITLES' not in line.upper():
-            continue
-
-        uri_match = re.search(r'URI="([^"]+)"', line, re.IGNORECASE)
-        if not uri_match:
-            continue
-
-        label_match = re.search(r'NAME="([^"]+)"', line, re.IGNORECASE)
-        language_match = re.search(r'LANGUAGE="([^"]+)"', line, re.IGNORECASE)
-        candidate_url = urljoin(manifest_url, uri_match.group(1))
-        label = (label_match.group(1) if label_match else '') or (language_match.group(1) if language_match else '')
-        subtitles.append(normalize_subtitle_entry(candidate_url, label=label, provider='embed'))
-
-    return dedupe_subtitles(subtitles)
-
-
 def fetch_subtitles_from_source(url, headers=None):
     if not url:
         return []
@@ -680,35 +318,6 @@ def enrich_extracted_subtitles(stream_url, stream_headers, embed_url, existing_s
     collected.extend(fetch_subtitles_from_source(stream_url, source_headers))
 
     return dedupe_subtitles(collected)
-
-
-def extract_subtitle_candidates_from_json_payload(payload):
-    candidates = []
-
-    def visit(value, context_label=''):
-        if isinstance(value, dict):
-            url_value = None
-            for key in ['file', 'src', 'url', 'track', 'subtitle', 'subtitleUrl']:
-                candidate = value.get(key)
-                if isinstance(candidate, str) and looks_like_subtitle_url(candidate):
-                    url_value = candidate
-                    break
-
-            if url_value:
-                label = value.get('label') or value.get('language') or value.get('lang') or context_label
-                candidates.append((url_value, label or ''))
-
-            for key, nested in value.items():
-                next_label = context_label
-                if key.lower() in ['label', 'language', 'lang', 'name'] and isinstance(nested, str):
-                    next_label = nested
-                visit(nested, next_label)
-        elif isinstance(value, list):
-            for nested in value:
-                visit(nested, context_label)
-
-    visit(payload)
-    return candidates
 
 
 def fetch_subtitles_from_subsource(tmdb_id, media_type, title=None, season=None, episode=None, languages="EN,AR", limit=6):
@@ -877,12 +486,9 @@ def fetch_subtitles_from_subdl(tmdb_id, media_type, season=None, episode=None, l
 
 def extract_stream_with_playwright(url, preferred_quality='Auto'):
     provider = detect_provider(url)
+    profile = get_provider_profile(provider)
     log_provider(provider, f"starting extraction quality={preferred_quality}")
-    worker_order = [('Desktop', False), ('Mobile', True)]
-    if provider == 'vidfast':
-        worker_order = [('Mobile', True), ('Desktop', False)]
-    elif provider == '111movies':
-        worker_order = [('Desktop', False)]
+    worker_order = list(profile.worker_order)
     
     BLOCK_DOMAINS = ["adscore", "dtscout", "doubleclick", "analytics", "clarity", "histats", "onclick", "popunder", "exoclick", "juicyads", "popcash", "jads.co"]
     SUCCESS_KEYWORDS = STREAM_HINT_KEYWORDS
@@ -903,7 +509,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
         capture_phase = 'target'
 
         def should_capture_candidates():
-            if provider != '111movies':
+            if not profile.warmup_url:
                 return True
             return capture_phase == 'target'
 
@@ -968,7 +574,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 return
 
             normalized_headers = dict(headers or {})
-            if provider == '111movies':
+            if profile.warmup_url:
                 target_referer = page.url if 'page' in locals() and page.url and page.url != 'about:blank' else url
                 normalized_headers['Referer'] = target_referer
                 normalized_headers['referer'] = target_referer
@@ -997,7 +603,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
                 log_provider(provider, f"[{mode_label}] launching chromium")
-                use_headed_browser = provider == '111movies' and can_launch_headed_browser()
+                use_headed_browser = profile.use_headed_browser and can_launch_headed_browser()
                 launch_options = {
                     'headless': not use_headed_browser,
                     'chromium_sandbox': False,
@@ -1013,7 +619,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 }
                 if use_headed_browser:
                     log_provider(provider, f"[{mode_label}] using headed browser to avoid Cloudflare challenge")
-                elif provider == '111movies':
+                elif profile.use_headed_browser:
                     log_provider(provider, f"[{mode_label}] headed browser unavailable, staying headless")
                 proxy_settings = build_playwright_proxy_settings()
                 if proxy_settings:
@@ -1054,7 +660,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 context.route(
                     "**/*",
                     lambda route: route.abort()
-                    if provider != '111movies' and route.request.resource_type in ["media"]
+                    if not profile.allow_media_requests and route.request.resource_type in ["media"]
                     or any(domain in route.request.url.lower() for domain in BLOCK_DOMAINS)
                     else route.continue_()
                 )
@@ -1193,10 +799,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         log_provider(provider, f"challenge wait error mode={label} error={exc}")
 
                 try:
-                    # Clear session for 111Movies
-                    if '111movies' in url:
+                    if profile.warmup_url:
                         capture_phase = 'warmup'
-                        page.goto('https://111movies.net', wait_until='domcontentloaded', timeout=8000); page.wait_for_timeout(500)
+                        page.goto(profile.warmup_url, wait_until='domcontentloaded', timeout=profile.warmup_timeout_ms); page.wait_for_timeout(500)
                         wait_for_challenge_clear('warmup')
                         local_streams.clear()
                         local_subtitles.clear()
@@ -1204,7 +809,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         log_provider(provider, f"[{mode_label}] cleared warmup candidates before target navigation")
 
                     capture_phase = 'target'
-                    page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                    page.goto(url, wait_until='domcontentloaded', timeout=profile.target_timeout_ms)
                     page.wait_for_timeout(250)
                     wait_for_challenge_clear('target')
                 except: pass
@@ -1319,15 +924,14 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     return finalize_result(context, browser, local_winner, "Success: Captured Quality")
                 
                 # Check discovery loop
-                discovery_loops = 8 if provider == '111movies' else 2
-                for attempt in range(discovery_loops):
+                for attempt in range(profile.discovery_loops):
                     if is_url_video(local_winner["url"]): break
                     if any(is_url_video(item.get('url')) for item in local_streams):
                         break
-                    page.wait_for_timeout(750 if provider == '111movies' else 250)
-                    if provider == '111movies' or not local_streams:
+                    page.wait_for_timeout(profile.discovery_delay_ms)
+                    if profile.force_interact_each_loop or not local_streams:
                         interact()
-                    if provider == '111movies' and attempt in {1, 3, 5}:
+                    if attempt in set(profile.extra_scroll_attempts):
                         try:
                             page.mouse.move(640, 360)
                             page.mouse.wheel(0, 300)
