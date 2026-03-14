@@ -1050,11 +1050,22 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 context.route(
                     "**/*",
                     lambda route: route.abort()
-                    if route.request.resource_type in ["media"]
+                    if provider != '111movies' and route.request.resource_type in ["media"]
                     or any(domain in route.request.url.lower() for domain in BLOCK_DOMAINS)
                     else route.continue_()
                 )
                 page = context.new_page()
+
+                def inspect_possible_stream_url(candidate_url, headers=None, label=''):
+                    if not candidate_url:
+                        return
+                    resolved_url = resolve_candidate_url(candidate_url, page.url if 'page' in locals() else url)
+                    if not resolved_url:
+                        return
+                    if looks_like_subtitle_url(resolved_url):
+                        remember_subtitle(resolved_url, label)
+                    elif looks_like_stream_url(resolved_url):
+                        remember_stream(resolved_url, headers)
 
                 def handle_request(req):
                     r_url = req.url
@@ -1092,16 +1103,59 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     except Exception:
                         pass
 
+                def handle_frame_navigation(frame):
+                    try:
+                        frame_url = frame.url
+                        if not frame_url or frame_url == 'about:blank':
+                            return
+                        inspect_possible_stream_url(frame_url, {"Referer": page.url})
+                    except Exception:
+                        pass
+
+                def handle_popup(popup):
+                    try:
+                        popup.wait_for_load_state('domcontentloaded', timeout=5000)
+                    except Exception:
+                        pass
+                    try:
+                        inspect_possible_stream_url(popup.url, {"Referer": page.url})
+                    except Exception:
+                        pass
+
                 page.on("request", handle_request)
                 page.on("response", handle_response)
+                page.on("framenavigated", handle_frame_navigation)
+                page.on("popup", handle_popup)
 
                 def interact():
-                    selectors = ["button", ".play-button", "video", ".v-la11", "iframe", "[aria-label*='Play' i]", "main", "canvas"]
+                    selectors = [
+                        "button", ".play-button", "video", ".v-la11", "iframe", "[aria-label*='Play' i]", "main", "canvas",
+                        ".fluid_control_playpause_big_circle", ".fluid_initial_play", ".fluid_initial_play_button",
+                        ".fluid_button.fluid_control_playpause", ".mainplayer", ".video-container", ".fluid_video_wrapper"
+                    ]
                     for frame in page.frames:
                         try:
-                            for s in selectors: frame.evaluate(f"document.querySelector('{s}')?.click()")
+                            for s in selectors:
+                                frame.evaluate(f"""
+                                    (() => {{
+                                        const el = document.querySelector('{s}');
+                                        if (!el) return;
+                                        try {{ el.click(); }} catch (e) {{}}
+                                        try {{
+                                            ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'touchstart', 'touchend'].forEach((eventName) => {{
+                                                el.dispatchEvent(new Event(eventName, {{ bubbles: true, cancelable: true }}));
+                                            }});
+                                        }} catch (e) {{}}
+                                    }})()
+                                """)
                         except: pass
-                    try: page.mouse.click(640, 360)
+                    try:
+                        for x, y in [(640, 360), (640, 330), (640, 390), (560, 360), (720, 360)]:
+                            page.mouse.click(x, y)
+                    except: pass
+                    try:
+                        page.keyboard.press("Space")
+                        page.keyboard.press("Enter")
                     except: pass
 
                 def wait_for_challenge_clear(label):
@@ -1168,30 +1222,73 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                                         return value;
                                     }
                                 };
+                                const pushFound = (value, label = '') => {
+                                    if (!value) return;
+                                    found.push({ url: absolutize(value), label });
+                                };
                                 for (const el of document.querySelectorAll('video, source, iframe, a, [src], [href], [data-src], [data-url]')) {
                                     for (const attr of attrs) {
                                         const value = el.getAttribute(attr);
                                         if (value && !/^javascript:/i.test(value) && !/^data:/i.test(value)) {
-                                            found.push({ url: absolutize(value), label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
+                                            pushFound(value, el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '');
                                         }
                                     }
                                 }
                                 for (const el of document.querySelectorAll('track[kind="subtitles"], track[kind="captions"], [data-subtitle], [data-track]')) {
                                     const value = el.getAttribute('src') || el.getAttribute('data-subtitle') || el.getAttribute('data-track') || el.getAttribute('data-src');
                                     if (value && !/^javascript:/i.test(value) && !/^data:/i.test(value)) {
-                                        found.push({ url: absolutize(value), label: el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '' });
+                                        pushFound(value, el.getAttribute('label') || el.getAttribute('srclang') || el.getAttribute('lang') || '');
                                     }
                                 }
                                 const configs = [];
+                                for (const key of ['__NEXT_DATA__', '__data', 'playerConfig', 'playerData', 'streamData', 'sources', 'source']) {
+                                    try {
+                                        const value = window[key];
+                                        if (typeof value === 'string') pushFound(value);
+                                        if (Array.isArray(value)) {
+                                            value.forEach((item) => {
+                                                if (typeof item === 'string') pushFound(item);
+                                                else if (item && typeof item === 'object') {
+                                                    ['file', 'src', 'url', 'playlist', 'manifest', 'hls'].forEach((prop) => pushFound(item[prop], item.label || item.srclang || ''));
+                                                }
+                                            });
+                                        } else if (value && typeof value === 'object') {
+                                            ['file', 'src', 'url', 'playlist', 'manifest', 'hls'].forEach((prop) => pushFound(value[prop]));
+                                        }
+                                    } catch (e) {}
+                                }
                                 for (const key of Object.keys(window)) {
                                     try {
                                         const value = window[key];
                                         if (value && typeof value === 'object') configs.push(value);
                                     } catch (e) {}
                                 }
+                                for (const value of configs) {
+                                    try {
+                                        if (Array.isArray(value.sources)) {
+                                            value.sources.forEach((item) => {
+                                                if (typeof item === 'string') pushFound(item);
+                                                else if (item && typeof item === 'object') {
+                                                    ['file', 'src', 'url', 'playlist', 'manifest', 'hls'].forEach((prop) => pushFound(item[prop], item.label || item.srclang || ''));
+                                                }
+                                            });
+                                        }
+                                        ['file', 'src', 'url', 'playlist', 'manifest', 'hls'].forEach((prop) => pushFound(value[prop]));
+                                    } catch (e) {}
+                                }
                                 const html = document.documentElement?.outerHTML || '';
                                 const matches = html.match(/https?:\\/\\/[^\"'\\s<>()]+/g) || [];
-                                for (const item of matches) found.push({ url: item, label: '' });
+                                for (const item of matches) pushFound(item);
+                                const encodedMatches = html.match(/[A-Za-z0-9+/=]{20,}/g) || [];
+                                for (const item of encodedMatches) {
+                                    try {
+                                        const decoded = atob(item);
+                                        if (/https?:\\/\\//i.test(decoded)) {
+                                            const decodedUrls = decoded.match(/https?:\\/\\/[^"'\\s<>()]+/g) || [];
+                                            decodedUrls.forEach((entry) => pushFound(entry));
+                                        }
+                                    } catch (e) {}
+                                }
                                 return found;
                             }
                         """)
@@ -1202,6 +1299,11 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                                 remember_subtitle(candidate_url, label)
                             elif looks_like_stream_url(candidate_url):
                                 remember_stream(candidate_url, {"Referer": url})
+                        for frame in page.frames:
+                            try:
+                                inspect_possible_stream_url(frame.url, {"Referer": page.url})
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -1213,13 +1315,20 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     return finalize_result(context, browser, local_winner, "Success: Captured Quality")
                 
                 # Check discovery loop
-                for _ in range(2):
+                discovery_loops = 8 if provider == '111movies' else 2
+                for attempt in range(discovery_loops):
                     if is_url_video(local_winner["url"]): break
                     if any(is_url_video(item.get('url')) for item in local_streams):
                         break
-                    page.wait_for_timeout(250)
-                    if not local_streams:
+                    page.wait_for_timeout(750 if provider == '111movies' else 250)
+                    if provider == '111movies' or not local_streams:
                         interact()
+                    if provider == '111movies' and attempt in {1, 3, 5}:
+                        try:
+                            page.mouse.move(640, 360)
+                            page.mouse.wheel(0, 300)
+                        except Exception:
+                            pass
                     scan_dom_for_sources()
 
                 if not local_streams:
