@@ -188,6 +188,7 @@ def is_challenge_page(html, current_url=''):
     content = ((html or '') + ' ' + (current_url or '')).lower()
     checks = [
         'checking your browser', 'verify you are human', 'just a moment',
+        'attention required',
         'cf-browser-verification', 'cf-challenge', 'cloudflare', '/cdn-cgi/challenge-platform/'
     ]
     return any(token in content for token in checks)
@@ -870,6 +871,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
     worker_order = [('Desktop', False), ('Mobile', True)]
     if provider == 'vidfast':
         worker_order = [('Mobile', True), ('Desktop', False)]
+    elif provider == '111movies':
+        worker_order = [('Desktop', False)]
     
     BLOCK_DOMAINS = ["adscore", "dtscout", "doubleclick", "analytics", "clarity", "histats", "onclick", "popunder", "exoclick", "juicyads", "popcash", "jads.co"]
     SUCCESS_KEYWORDS = STREAM_HINT_KEYWORDS
@@ -984,8 +987,9 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 
                 log_provider(provider, f"[{mode_label}] launching chromium")
+                use_headed_browser = provider == '111movies'
                 launch_options = {
-                    'headless': True,
+                    'headless': not use_headed_browser,
                     'chromium_sandbox': False,
                     'timeout': 45000,
                     'args': [
@@ -997,6 +1001,8 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                         '--disable-software-rasterizer',
                     ],
                 }
+                if use_headed_browser:
+                    log_provider(provider, f"[{mode_label}] using headed browser to avoid Cloudflare challenge")
                 proxy_settings = build_playwright_proxy_settings()
                 if proxy_settings:
                     launch_options['proxy'] = proxy_settings
