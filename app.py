@@ -616,7 +616,17 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                 log_provider(provider, f"promoted winner url={short_url(candidate_url)} force={force_winner}")
 
             return is_high_priority_stream(candidate_url)
-        
+
+        def stop_page_loading():
+            try:
+                if 'page' in locals() and page and not page.is_closed():
+                    page.evaluate("window.stop && window.stop()")
+            except Exception as exc:
+                message = str(exc).lower()
+                if 'execution context was destroyed' in message or 'page closed' in message or 'target page, context or browser has been closed' in message:
+                    return
+                log_provider(provider, f"[{mode_label}] window.stop failed error={exc}")
+
         try:
             with sync_playwright() as p:
                 ua = get_profile_user_agent(profile, is_mobile, url)
@@ -720,7 +730,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                     if any(kw in r_url.lower() for kw in SUCCESS_KEYWORDS):
                         if is_url_video(r_url):
                             if remember_stream(r_url, dict(req.headers)):
-                                page.evaluate("window.stop && window.stop()")
+                                stop_page_loading()
 
                 def handle_response(response):
                     try:
@@ -753,7 +763,7 @@ def extract_stream_with_playwright(url, preferred_quality='Auto'):
                             headers = dict(response.request.headers)
                             headers['Accept'] = headers.get('Accept', '*/*')
                             if remember_stream(r_url, headers, force_winner=is_playlist_response(r_url, content_type)):
-                                page.evaluate("window.stop && window.stop()")
+                                stop_page_loading()
                     except Exception:
                         pass
 
