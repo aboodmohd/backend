@@ -58,6 +58,12 @@ SUBSOURCE_API_KEY = "sk_2da97448424b9e7c94fbc9756291c5eac67711df44b978f43fc7ba54
 SUBTITLE_CACHE = {}
 STREAM_CACHE = {}
 STREAM_CACHE_TTL_SECONDS = int(os.getenv('STREAM_CACHE_TTL_SECONDS', '5400'))
+CACHE_STATS = {
+    'hits': 0,
+    'misses': 0,
+    'expired': 0,
+    'refreshes': 0,
+}
 PLAYWRIGHT_PROXY_SERVER = os.getenv('PLAYWRIGHT_PROXY_SERVER', '').strip()
 PLAYWRIGHT_PROXY_USERNAME = os.getenv('PLAYWRIGHT_PROXY_USERNAME', '').strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.getenv('PLAYWRIGHT_PROXY_PASSWORD', '').strip()
@@ -69,23 +75,51 @@ def build_stream_cache_key(url, preferred_quality, providers=None):
     return f"{url}|{preferred_quality}|{normalized_providers or 'default'}"
 
 
+def log_cache_event(event, cache_key='', **details):
+    stats = (
+        f"hits={CACHE_STATS['hits']} misses={CACHE_STATS['misses']} "
+        f"expired={CACHE_STATS['expired']} refreshes={CACHE_STATS['refreshes']} size={len(STREAM_CACHE)}"
+    )
+    summary_parts = [f"{key}={value}" for key, value in details.items() if value not in (None, '', [], {})]
+    suffix = f" {' '.join(summary_parts)}" if summary_parts else ''
+    print(f"🧠 [cache] {event} key={short_url(cache_key, 72) if cache_key else 'n/a'} {stats}{suffix}")
+
+
+def clone_cached_payload(payload):
+    return json.loads(json.dumps(payload)) if payload is not None else None
+
+
 def get_cached_stream_result(cache_key):
     cached_entry = STREAM_CACHE.get(cache_key)
     if not cached_entry:
+        CACHE_STATS['misses'] += 1
+        log_cache_event('miss', cache_key)
         return None
 
     if cached_entry['expires_at'] <= time.time():
         STREAM_CACHE.pop(cache_key, None)
+        CACHE_STATS['expired'] += 1
+        CACHE_STATS['misses'] += 1
+        log_cache_event('expired', cache_key)
         return None
 
-    return cached_entry['payload']
+    CACHE_STATS['hits'] += 1
+    log_cache_event('hit', cache_key, provider=(cached_entry.get('payload') or {}).get('provider'))
+    return clone_cached_payload(cached_entry['payload'])
 
 
 def set_cached_stream_result(cache_key, payload):
     STREAM_CACHE[cache_key] = {
-        'payload': payload,
+        'payload': clone_cached_payload(payload),
         'expires_at': time.time() + STREAM_CACHE_TTL_SECONDS,
     }
+    log_cache_event('store', cache_key, provider=(payload or {}).get('provider'), ttl=STREAM_CACHE_TTL_SECONDS)
+
+
+def invalidate_cached_stream(cache_key, reason='invalid'):
+    if STREAM_CACHE.pop(cache_key, None) is not None:
+        CACHE_STATS['refreshes'] += 1
+        log_cache_event('invalidate', cache_key, reason=reason)
 
 
 def build_playwright_proxy_settings():
@@ -1297,8 +1331,15 @@ def resolve():
         cache_key = build_stream_cache_key(url, preferred_quality, requested_providers)
         cached_payload = get_cached_stream_result(cache_key)
         if cached_payload:
-            log_provider(requested_provider, f"cache hit quality={preferred_quality} url={short_url(url)}")
-            return jsonify(cached_payload)
+            cached_url = cached_payload.get('url')
+            cached_headers = cached_payload.get('headers', {})
+
+            if cached_url and probe_stream_candidate(cached_url, cached_headers):
+                log_provider(requested_provider, f"cache hit quality={preferred_quality} url={short_url(url)}")
+                return jsonify(cached_payload)
+
+            log_provider(requested_provider, f"cached stream failed validation, refreshing quality={preferred_quality} url={short_url(url)}")
+            invalidate_cached_stream(cache_key, reason='probe_failed')
 
         resolved_payload, attempt_details = run_provider_race(url, preferred_quality, requested_providers)
         if resolved_payload:
